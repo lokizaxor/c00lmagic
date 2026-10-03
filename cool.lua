@@ -88,14 +88,18 @@ local CONFIG = {
 	-- Executors only: it needs request/http_request plus writefile and
 	-- getcustomasset. It is downloaded once and cached in the workspace; if the
 	-- download fails the embedded logo is used instead. Leave empty to skip.
-	LogoUrl = "",
+	LogoUrl = "https://raw.githubusercontent.com/lokizaxor/Lumen/main/lumen_logo_transparent_512.png",
+	-- Same idea for the icon-only sidebar logo (optional).
+	LogoCompactUrl = "",
+	-- Where downloaded images are cached in the executor workspace. One file per
+	-- link, named from the link, so a link is only ever downloaded once.
+	MediaFolder = "ModernGui/MediaCache",
 	-- How this script is started again in the NEW server after a hop. Executors
 	-- only, and only needed when the script is not already auto-executed:
 	-- ReloadUrl is a link loadstring can fetch, ReloadFile a path in the executor
 	-- workspace. Leave both empty if your executor re-runs it by itself.
-	ReloadUrl = "",
+	ReloadUrl = "https://raw.githubusercontent.com/lokizaxor/c00lmagic/main/cool.lua",
 	ReloadFile = "",
-	LogoUrlFile = "ModernGui/lumen_logo_download.png",
 	ToggleKey = Enum.KeyCode.M,
 	AutoOpen = true,
 	PanelSize = Vector2.new(940, 560),
@@ -127,6 +131,7 @@ local DEFAULTS = {
 	QuickOverlay = false,
 	QuickOverlayDetails = true,
 	Shimmer = true, -- slow accent highlight travelling round the window border
+	BgImageStrength = 25, -- how visible the optional window background image is (%)
 	-- AFK mode itself is runtime-only (never a default that survives a restart);
 	-- these two are real preferences.
 	AfkPause3D = true,
@@ -976,6 +981,196 @@ local function iconTint(holder, color)
 	end
 end
 
+-- MEDIA  (download once, cache on disk, show through getcustomasset)
+-- Roblox cannot load an image from a web address, so a link is turned into a
+-- local file first: downloaded with whatever HTTP the executor offers, checked
+-- to really be a PNG or JPEG of a sane size, written under CONFIG.MediaFolder
+-- (one file per link, named from the link) and handed to getcustomasset. The next
+-- run finds the file and never downloads again. Needs request/HttpGet, writefile,
+-- readfile, isfile and getcustomasset; without them every call just reports why.
+local Media = { Memory = {}, Inflight = {}, MaxBytes = 8 * 1024 * 1024 }
+do
+	local PNG_SIGNATURE = "\137PNG\r\n\26\n"
+	local JPEG_SIGNATURE = "\255\216\255"
+
+	local function fileApi()
+		local asset = getcustomasset or getsynasset
+		if type(asset) == "function" and type(writefile) == "function" and type(readfile) == "function"
+			and type(isfile) == "function" then
+			return asset
+		end
+		return nil
+	end
+
+	function Media.Available()
+		return fileApi() ~= nil
+	end
+
+	-- "png", "jpg" or nil: judged by the file's own first bytes, never by the
+	-- link's ending or the server's say-so.
+	function Media.Kind(data)
+		if type(data) ~= "string" then
+			return nil
+		end
+		if string.sub(data, 1, 8) == PNG_SIGNATURE then
+			return "png"
+		elseif string.sub(data, 1, 3) == JPEG_SIGNATURE then
+			return "jpg"
+		end
+		return nil
+	end
+
+	-- A PNG states its width right after the signature, the chunk length and the
+	-- "IHDR" tag. JPEG is not parsed; nil there.
+	local function pngWidth(data)
+		local a, b, c, d = string.byte(data, 17, 20)
+		if a then
+			return a * 16777216 + b * 65536 + c * 256 + d
+		end
+		return nil
+	end
+
+	-- Short, stable file name from the link. (31-multiplier string hash kept
+	-- under 2^31 so doubles stay exact; the length is added to make a clash
+	-- between two different links very unlikely.)
+	function Media.Name(url)
+		local h = 7
+		for i = 1, #url do
+			h = (h * 31 + string.byte(url, i)) % 2147483647
+		end
+		return string.format("%08x_%d", h, #url)
+	end
+
+	local function httpBody(url)
+		local requester = (type(syn) == "table" and syn.request)
+			or (type(http) == "table" and http.request)
+			or http_request
+			or request
+		if type(requester) == "function" then
+			local response = requester({ Url = url, Method = "GET" })
+			if type(response) ~= "table" then
+				return nil, "the request returned nothing"
+			end
+			if response.StatusCode and response.StatusCode ~= 200 then
+				return nil, "the server answered HTTP " .. tostring(response.StatusCode)
+			end
+			return response.Body
+		end
+		if type(game.HttpGet) == "function" then
+			return game:HttpGet(url)
+		end
+		return nil, "HTTP requests are not available here"
+	end
+
+	local function ensureFolder()
+		local path = CONFIG.MediaFolder
+		if type(isfolder) == "function" and type(makefolder) == "function" then
+			local built = ""
+			for part in string.gmatch(path, "[^/]+") do
+				built = built == "" and part or (built .. "/" .. part)
+				if not isfolder(built) then
+					makefolder(built)
+				end
+			end
+		end
+	end
+
+	-- Blocking: call from a task.spawn. Returns asset, nil, pixelWidth on
+	-- success, or nil, reason.
+	function Media.Fetch(url)
+		if type(url) ~= "string" or not url:match("^https?://") then
+			return nil, "that is not a web link (it must start with http:// or https://)"
+		end
+		local known = Media.Memory[url]
+		if known then
+			return known.Asset, nil, known.Px
+		end
+		local customAsset = fileApi()
+		if not customAsset then
+			return nil, "this executor has no file functions (writefile / getcustomasset)"
+		end
+		-- One download per link: anyone asking while it is in flight waits for it.
+		if Media.Inflight[url] then
+			local waited = 0
+			while Media.Inflight[url] and waited < 40 do
+				task.wait(0.1)
+				waited = waited + 0.1
+			end
+			known = Media.Memory[url]
+			if known then
+				return known.Asset, nil, known.Px
+			end
+			return nil, "the other download of this link failed"
+		end
+		Media.Inflight[url] = true
+		local ok, asset, why, width = pcall(function()
+			local base = CONFIG.MediaFolder .. "/" .. Media.Name(url)
+			for _, extension in ipairs({ "png", "jpg" }) do
+				local path = base .. "." .. extension
+				if isfile(path) then
+					local data = readfile(path)
+					if Media.Kind(data) == extension then
+						return customAsset(path), nil, extension == "png" and pngWidth(data) or nil
+					end
+				end
+			end
+			local data, reason = httpBody(url)
+			if not data then
+				return nil, reason or "the download failed"
+			end
+			if #data > Media.MaxBytes then
+				return nil, "the image is larger than " .. math.floor(Media.MaxBytes / 1048576) .. " MB"
+			end
+			local kind = Media.Kind(data)
+			if not kind then
+				return nil, "the link did not return a PNG or JPEG (expired, private, or not a direct image link)"
+			end
+			ensureFolder()
+			local path = base .. "." .. kind
+			writefile(path, data)
+			return customAsset(path), nil, kind == "png" and pngWidth(data) or nil
+		end)
+		Media.Inflight[url] = nil
+		if ok and type(asset) == "string" and asset ~= "" then
+			Media.Memory[url] = { Asset = asset, Px = width }
+			return asset, nil, width
+		end
+		return nil, ok and (why or "getcustomasset returned nothing") or tostring(asset)
+	end
+
+	-- Fetches in the background and, if the label still exists, shows the result.
+	-- onDone(success, reason) is called either way.
+	function Media.Apply(label, url, onDone)
+		task.spawn(function()
+			local asset, why = Media.Fetch(url)
+			if asset and label.Parent then
+				label.Image = asset
+			end
+			if onDone then
+				onDone(asset ~= nil, why)
+			end
+		end)
+	end
+
+	-- Deletes every cached file. Returns how many were removed, or nil if this
+	-- executor cannot list or delete files.
+	function Media.ClearCache()
+		Media.Memory = {}
+		if type(listfiles) ~= "function" or type(delfile) ~= "function" then
+			return nil
+		end
+		local removed = 0
+		pcall(function()
+			for _, path in ipairs(listfiles(CONFIG.MediaFolder)) do
+				if pcall(delfile, path) then
+					removed = removed + 1
+				end
+			end
+		end)
+		return removed
+	end
+end
+
 -- LOGO SOURCE -----------------------------------------------------------
 -- Roblox cannot display an image that only exists as a chat attachment, so the
 -- Lumen logo travels inside this script and is turned into something an
@@ -994,335 +1189,360 @@ end
 -- A `do` block, so it adds no locals to the main chunk.
 do
 	local EMBEDDED_PNG = [==[
-iVBORw0KGgoAAAANSUhEUgAAAQAAAAEACAMAAABrrFhUAAAB/lBMVEVhot4oYaVUaZ0nZP8AIP8CH5lyiqrLz9tMWXsAJtk1S3si
-j9CWtNgpaNtLXo6lxOckTJESJnsZV98HIZgq8/6PmLNMdc4bVLFOc+Eopv9bmtoAK+VadLR2yNw4iqdZiv8kPrFRjLoAAAABVP8A
-TP8BVP8ATP8AJHry+v0AKIwAKYkAN7EASe8AJX0DV/UALJcHZ/jQ9v0BR+0CU/oKd/oAO8UANq4AKK/O5/wANtEJh/oMl/sAJ4EA
-KsoARNYBNJK02Pyu6f0AM6OP5v1t2PwBM5lNx/0AOOcMp/wup/wBRtCx9v0OYv80tvwAHHoQt/wBRMgAPdQsmP0AGo7P2+4Nx/wA
-N/8BRq0nh/uqyvaP+P1KufxU0/0AKP905Pxt9f0sx/2EnMyM2PyNpM1P6v0AKq8CVtEt2PwCMowO1/1VZYvm6/hR9P4AKqIy5v0A
-N/8EVrBtyPsAHH2KlbBreJcDZ9Wvt8wKYf8DdtIkevsAG4gON3oJQ7IFQpcAOOwM5v4AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA
+iVBORw0KGgoAAAANSUhEUgAAAQAAAAEACAMAAABrrFhUAAAB/lBMVEUmo/ii4/lh4/wf0/wLWdXU3/AOTatWre0BJe0CKpYCN9Ub
+aPYCHpGPqdUIScsA//8AGngCJqqZrNIPRrmsyuwjV6hUbKzN2epfovlvjtiYqdEAGnv7/f8OLLYZZNsdnv8jSqFhdesuVncOHHiU
+n7Zoa3trmtFSa7OstvH/mgACL9urra2t8f92AAVmcLVtibtYc8tjlqJq3N3/6iFQfchlxteZMwD/AAD/9GwsnbdlyOYqhb5TcMSm
+phySx9LMZgD/qn8SJDYQP8ckgcY4n95VAFViMeFCXbx5lL97kb9//wB//39px7aZZgCRSM6Bkb3/c9D/mbLN090AAAABVv4AAP4B
+Sv4DVf7x+/0BJ40Afv8CSv0BJHoAO/4BN7IBKIkCZv4CSe0AK5cEV/QBJHwIZ/jR9v0Kd/kCRdUBR+0CVPYBKK7P5vsBNtEBNq4B
+G3cKh/oMl/oAKsq01/wBJoKu6fwCNJNu2fsBNKOP5vwCO8UBMpkvp/tNx/wNp/sBOecAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA
 AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA
-AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAADqx0PXAAAAgHRSTlP/9v0aGuf///BY5////6b/ou5UlP///3RUFFf/c///K3ZtAAoL
-LjDy//+vdUzU/5T///9G/2T////////F/1j///+E//+S////////Dv/0/2JZ/////w////////8K/////////3f//6n/////hf8u
-///V/////y7//7Pzc/9N/72eRHoAACVpSURBVHja7Z2JQ1rJs+9xTTRmTMzM/Ob3u/fd+x7nsB8EZBfEFRfELSouUeMk4jYuiVl0
-TMb866+qejmHRQQUjCQ9mZnECPL9dFV19enqbpO5cZuCzcKa368lgi5XAn6r5DRTI+tXjQAS80GXVqC/sQEYTAABzPsL5DcwACVP
-v5ZIFNPfsACUPACaVsT8wUfURgWQztEPFlC0+4GAqcENQBCwFNOvNiwApRCAUqypqtrwAJQS+hs2Bij5AJRr9KuK2dTo+pXr9YMB
-mBsRQL7+68RDMzcigDyh13Y/0994AJTymvx+0w+u/wcFYG5YAJXKbzAAlYpvNABVyP+xABR90Q8C4PoXmX4E/aVeZfqRe7+BAFSp
-vtEBlPNKU6PqL/elph9cfwMAqN76GwPALfU/eAC3lP/QASi31t+AACp8C9MPbf8PG4ByF/q/IwDKXch/iACq+fhK1XOf7wtAdZ//
-hqceykMBUGUPllSffigWUMWjq/Je+jBigFLV08syX/r9u0DFazeVvvg7B6AotyHw4AEoBWv3pSpY8sTcjt33AOBa+SUgVKy+QgKm
-e9Kvl69p7N/rGVQs/3t9HlCgH8s354NBF7b5hFbCFcxF6zvuhIDpHuTL4l1UPpKkNgIMNH+JaKDUyAhM99P7TD6I33c6nfF43Onc
-BwaJeyBguo/+R/lfXaQ+7nbbqLkBASOgKPVEYKqzfla5TL0P8pn6QWgOmy3uZDZQhrLSY2dFBEx110/WD/L340L9PysrK4ODNpsz
-6ZovxwSM46b+W0t1BEz11M+7H6x/f9/pFurfvftkerpSPgDLte07XRvM1c+6n4yfyW+6MA3bOYCRoHYTgULZVvhltfLfV0zAVFf9
-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
-Py9lclV006kEAAAAAElFTkSuQmCC
+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
 ]==]
-	local EMBEDDED_PNG_BYTES = 10296
+	local EMBEDDED_PNG_BYTES = 12375
 	local EMBEDDED_PIXELS = [==[
-/xdQqulhodjlV2yfmCRi3SJuluIQWZPXop+01t4kXLAaGkuqkzKb0/SsxNvpLlqwaRVo0eljcbYaWGuea1h54RqUstmYFyVZDRQo
-oSFMZqXetcjrnwUs1ykQUsSmMJ7iEXeMs2Z5kLad0tzp6gEQoWgMKJDTACLbRnGIuN1hjtR0mKrSbgAuopwhjuORPvT+/24MDAZk
-YRIGVnjIclDy8gy/v38EmpqyB4qYvHqkrb7yrKz/BKzm/wT//wABzMzmBQI/xdgVXNdTLou5FgDU/wZVqlUDVaqqA6TC613/qqoD
-wM3oiwAAAAAASv4LAVb+CwA7+wgBVP4vAAD/AwEni/v0/P7+ACmJrwAke+4AN7RyAEv8MQBK7kjR9v7/ACyWlgRY8/8Ld/f/AUTX
-VQho9//N6Pr9ADfQ/gFH7P8CN6/9ACiw/g+X+v8AJXzTAWf/CguI+f4APMVkACaEyU/H+/8AK8r+ATSmhW3X+/8Pp/r/kub9/wIy
-mo8AGXjuAj3PWbHo/f8vqPv/NLb8/wAaivwCR83+ADvo/wdX0P6sx+f9AT3ZCgQ0lfy0+P7/kKjL8AAYd9MoiPn/s9f4/gZ7/ggQ
-t/v9LZn8/k25+v5vy/v/ACn8B1LV/P5y6P7/////AgZIrv0EU/dEy9rs+Alm1f0Qx/7+AABPEi7Y/f+S9f7/S6jz/Y3H6PwDKKtx
-MMf6/jHo/v9KevINNGn0DH9/fwOK2fr/BCjNTwD//wFU9f7/kKjVkAlJ1wxLZ67zU+n9/2mazgWuu9PJp7nU8gAAMg0ABXcQAByI
-qQM3tVcW6f//M2aZBShmr3pu9v3/AAGPFwAbjo4FQ8hiDli4+hDX//91lM+TdpjK92y67P2LmbqKBzORrAA3r6oJRbFyBli6fzZ8
-/AmbstLxyNbyjQAYe7cAM5kFADj7MgxZ1gkMd83+LkmT9FVVqgNXdbrIcIe4TXuTuvF0ptP2f7+/BIabxouQq9u3v7+/BP//sgMA
-BOokAD9/BAQ/vwcAZswFE4XQ/iZW0w8mfPX+UGqnjlN40hlLeMj/UJj/CVyj4n9Ottj4ZXaahHOIsotujtSaYKLif3n//wOYq9DS
-nLjsqQAKcNgADnLoAAOqDwAHuSoAHaf+ABvFRwAkfboAJ7APACisXQko7y0ENZPJAjqzyxFl/ysWiv8MCKf/BipKlNUoRsoVJ0n/
-Cixktvwpa9UKM4r/Dj+b/wlWZphJTWevZVFqstRJadcRWXexR1p7wrxbhLKHSIXL/VeK/wxPmdD1Var/Bki2/wdmZpkFcbj/B4SY
-veiZmcwFhZzG8pOivIOMuuj9AAuRIwAGgpEAANgUARypagASzy8AGPYuCia2NDk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5
+/1Sc2uuZseNeJWLVJCBm21xgnOJiYpndG5+37hcplfQQYqHcqjZdqu2cuOHrFyjjJDKd2e5QbrEcytHjbFZ5uuJLZOYkZs3r3pSw
+5JXO2vYM09fklA0sks4+d7sNKmfa/Cbz//9Rd9xdV3jHmqvG4h+hzelrtcLjjQkpt18kTKGkI4rmci6a7qJOery8THDE/ojgtxiq
+xuPY//+qAwAAdZwAD27bACqqBgALhIUAGMBKBjnAnAEv4f86xP8NRFK8c3WTut1/1P8GecrkWF/D7o6LedoqmZlmBa6uvSP/AAAB
+//8AAQAAAAABVv4OAAD+AwFK/BADVv4uAieL/PP8/v4CKImvA0z8LgEle/AAf/8DAjezcwA8/gYCSuxKAWf/CdL1/f8DRtdXBFj0
+/////wIJaPr/Akju/wt4+P4DN8/9ASyWlM3o/PwBJXzUASiw/wEaeO8BK8z+C4j6/g6X+v9Px/j9Azav/QI8xGZt2Pv/BDWU/gNU
+9EgPqPv/L6f6/gIzmpECNaWEkub8/wInhMiz+P7/ATrm/zS2/P8HRq//ARmN/gNIzv2v6v3/AjvOWQhY0P4A//8BtNf5+wEYd9MD
+Q8hkrcns+0y4+vxyyPf8KIn6/i2Z/P0Stvv+b+j+/w/G/f85fv4IDGfV/TDZ/P9V1fv9Byqsbwdk/ypx9P3/jNn7/AMpzE4y6P7/
+kff9/8/Z7LDn7PPvMcf8/0toq/Kz//0Eyd32+a3I78sBLaKGBTSQqgM40ggAOPYuEFez/Ap5z/9Iq/n/UPT+/32+/wUACPEmABh6
+uAQ/vwQkevT/iqXS6pXJ6f6sxupsr8fsrQAZi5YBGoOqACj9EBDo//8sav0ST2qs0VDo/f9/f/8Cf///Aqqq/wMAANYQKUeP7XSc
++wp6qf8Ik6fQ1aqqqgOnveq0ttH5ydDW5I4BDW7pCBXzFQAjfbwEN7CtBlfYCBPX//5Vqv8Ecbrx/6m428uxye5UzdjpWtvi7rAA
+Hq3/Bhr0KgEkuFQIQ7pvBkKzyQBI2gkAVaoDFma4/hhp6lUAf78ECozY/zi9/wVKl9tscJbM/m6p1/9oqeRueqTqiISo74WQtux0
+isTe/JHL7nOktc9KprberKO66W6ouuqPz9vxyNLi9dgAAH8CAAC/BAAp2QwAKPUzBTGQ0A5Ns5UKRMqwDFay1wtSzHAAf38CFHT/
+JipKk88uV9ExLlnnEjGH3WtLabCuVXO6xUhz3UdOee8OUIn/Dk6V/wp/f38CaIfQp3KU3HF7l+VTf7+/BJW22jGYuObRpbjX97zD
+01O80fGsAA7IRgAbonQAJJh8BS2gsA4o1jYAKu1CADfmRxZGzigHRtCKB0bO0jk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5
 OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5
-OTk5OTlTOjtEPT09RVVDRD06Ojo6Ojo6OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5
-OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk+PDo6Oz09RD1FSj07Ojo6Ojo6
+OTk5OTk7RTw9PT09XVpaPT1BPDo6Ojo8OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5
+OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5O0U6Oj09PT1dRj09PDw8Ojw6
 Ojo5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5
-OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTs7Ojs6RD09RUU9Ojw6Ojo6Ojo6Ojk5OTk5OTk5OTk5OTk5OTk5OTk5
+OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTtFRzo6PT09Rl09PTo6Ojw6OjxHOzk5OTk5OTk5OTk5OTk5OTk5OTk5
 OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5
-OTk5OTk5OTk5OTk+Ojo6Ozs9PT09Ozs8Ojo6Ojo6Ojo6OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5
-OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTw6Ojo6Ozs9PTuN
-Ojo6Ojo6Ojo6Ojw5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5
-OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk6Ojo6Ojo6PTs7PDo6Ojo6Ojo6Ojo8OTk5OTk5OTk5OTk5
+OTk5OTk5OTk5OTk5Ojo6Ojo9PT09PTo6Ojo6OjpFRUM7OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5
+OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTtHRzo8Oj09PTo8
+Ojw6OjpHPDpHOzs5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5
+OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5RTo8Ojo8PTo6PDo8R0dDQzpFQzs7OTk5OTk5OTk5OTk5
 OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5
-OTk5OTk5OTk5OTk5OTk5OTk+Ojo6Ojo6Ozo6Ozo6Ojo6Ojo6Ojo8PDk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5
-OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTw6Ojo6
-Ojo6Ojw6Ojo6Ojo6Ojo6OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5
-OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OT48Ozo6Ojo6Ojo6Ojo6Ojo6Ojo8Ozk5OTk5OTk5
+OTk5OTk5OTk5OTk5OTk5OTk5O0U6Ojw6Ojw6OjpFOkU6OkNDQzs5OTs5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5
+OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTtFOjo6
+Ojo6Ojw6R0VDQztDQzs5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5
+OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk7O0c8PDw6Ojo6RTpHOkM7Ozs7Ozk5OTk5OTk5
 OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5
-OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5PDw6Ojo6Ojo6Ojo6Ojo6Ojw7OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5
+OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OztFOjw8Ojo6RUVDQ0NDQzk5OTk7OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5
 OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5
-OT46Ojo6Ojo6Ojo6Ojo7PD4+OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5
-OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk6Ojo6Ojo6Ojo6Ojo6PD45OTk5OTk5
+OTk7Ojo8Ojw8PENDOzs7Ozk7OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5
+OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk7Ozs6Ojw6PDpFbTs7Ozk5OTk5OTk5
 OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5
-OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5Ozo6Ojo6Ojo6Ozw8Pjk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5
+OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTtDRzo6Ojo6RTk7Ozk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5
 OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5
-OTk5OTk5O3Q6Ojo6Ojo6Ojw8OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5
-OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTs6Ojo6Ojo6Ojo6PD45OTk5
+OTk5OTk5OTs7Q0VHOjo6Ojs7OTs5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5
+OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk7OzpFOjo6Ojw7OTk5OTk5
 OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5
-OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk8Ojo6Ojo6Ojo6PDs5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5
+OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OztDOjo6OjpHOzs5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5
 OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5
-OTk5OTk5OTk5OTk+PDs6Ojo6Ojo6Ojo+OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5
-OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk+Ozw8PDo8PD45OTk5OTk5OTk5OTk5OTk5OTk7dDs6Ojo6Ojo6Ojo6
-Oj45OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5
-OTk5OTk5OTk5Pjt0Ozo6Ojo6Ojo6Ojs5OTk5OTk5OTk5OTk5OTk8Ozo6Ojo6Ojo6Ojo6Ojo6PDk5OTk5OTk5OTk5OTk5OTk5OTk5
-OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5Ozw6Ojo6Ojo7Ozo6Ojo6
-Ojo8Pjk5OTk5OTk5OTk5PDo6Ojo6Ojo6Ojo6Ojo6Ojs7OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5
-OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5Pjo6Ojo6PDo6Ozs6Ojo8Ojo6Ojo6Oz45OTk5OTk5OT46Ojo6Ojo6
-Ojo6Ojo6Ojo6Ojs+OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5
-OTk5OTk5OTk5OTk5OTw7Ojo7Ojw6PT09PT09Ojo6Ozo6Ojo6Ozs8Pjk5Pjw6Ojo6Ojo6Ojo6Ojo6Ojo6Ojo6Ojs7OTk5OTk5OTk5
-OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OT46Ojo6Ojs9PT1F
-RUpKSkpFPT07PDo6Ojo6Ojo6PDs7Ojo6Ojo6Ojo6Ojo6Ojo6Ojo6Ojo6Ojo7OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5
-OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk8Ozo6PDs9PT1FQ0NZR0FBQVlDRT09Ojo6Ojo6Ojo6Ojo6
-Ojo6Ojo8Ojo6Ojo7Ozs6Ojo6Ojo6Ojo6Pjk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5
-OTk5OTk5OTk5OTk5OTk5OTk5Ozo6Ojo7PT1FQ1lHQVJCQj8/UkFDRT06Ozo6Ojo6Ojo6Ojo6Ojo7PDs7Ozs8Ozo7Ojo7PDs6Ojo6
-Ojo6Ozk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTs6Ojs6
-Oz15SkNdQUI/P2l4DJ4/UllKPTs7Ojo6Ojo6Ojo6Ojs6PDs9PT09PTs9PT09REQ6Ojs8Ojo6Ojo6Ozk5OTk5OTk5OTk5OTk5OTk5
-OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk7Ojo8Oz09RUNZQVJCaWl4v4FM4T9SXVU9PTs8
-Ojs7Ojo6Ozw7Ojs7PT09PT09PT09PT1EPT09RDs7aDo6Ojo6Ozk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5
-OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5Ozo6PDs9PUpDXUFCP2l4r6JGQG54P1ZdQ3k9PTo7Ozo6aDs6Oz09PT1FRUVKRUpfVVVV
-VVVVSkVEPUQ7Ojs6Ojo6Ozk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5
-OT46Ojs6PXlKQ0FSQj9Pe6JGQEBAAWlCVl1DRT09PT09PT07PT09PUVKVUNZWV1HR0FBQUFBQUFHWUNKRT09Ozo6Ojo7Pjk5OTk5
-OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5Ojo7Oj09nV1BQj9pnrVMQEBAQEDs
-P0JBXUNFPT09PT09PURFSlVVQ0dBQVZSUkJCQkI/QkJCQkJSQUdDSkVEOjs6Ojo8OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5
-OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTs6Ozs9RZ1dUj8/eO5MQEBAQEBARp4/QkFZQ0V5eUVFRUpVQ0NDR0FBUkJC
-Qj8/Pz8/Pz8/Pz8/Pz9CUkEhVUVEOjs6Ojs+OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5
-OTk5OTk5OTk+Ojo6PXlDQVI/AOx6QEBAQEBARkBuTz9SQVlDQ19VVUNDQ1lHQUFSQkI/Pz8/P1BPT09NTU1NTU9PPz8/QkFHVUVE
-Ojo6Ojw5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTo6aDs9naRCP8RuQEBA
-QEBARkZGQLU/P1JBXVlDQ0NDXUdHQVZCQkI/Pz9QWE1NZU5ISEhLS0tITmRNTz8/QlZHX0Q6Ojo6Oz45OTk5OTk5OTk5OTk5OTk5
-OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk+Ojo7PZ1BQuFnQEBAQEBARkZGRkZAxD9CUkFBXVlHR0dBQVJe
-XmM/UGRmSW1hcldzc3NzgXNzcoBtS0hkT1A/QlZDRUQ6PDo6Pjk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5
-OTk5OTk5OTk5OTk5OTk5OXQ7OjsxlbCSQEBAQEBGRkZGRkZGRkx4P0JWQUFBR0FBUkJCaU9me0lUUVthYWJyV1dadn9qRkBAQEyB
-AUtOTVA/QkFDRUQ8Ozo8OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk+Ojo621ne
-TEBAQEBGRkZGRkZGRkZqZ09CQlJBQUFBVj9pT2RkZHgAT09QPz9QUE1kZEhJUWF1dmpGQEBGoktOTz9CUkdKRDo7Ojw5OTk5OTk5
-OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OT46Ojt5QZJARkZGRkZGRkZGampqXGqhYz9CQkJC
-Pz8/T9rZVkFsbGxCQkJCPz8/P2lPT3hme0lRcI9qampAgUtNUD9CQVVEOjo8PDk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5
-OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5Pjs8U0WkTEZGRkZGRmpgYGpqalxcasQ/Pz9CP1ZBWUNDll9DVZ1DWVlHR0FBUlJSQkI/
-aWlPeGZ7VGJ2mn9qok5PP0JBVUU6Ojw8OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5
-OTlTOzpTQxNGRkxGamBgYGBgYGpcWnZceD8/VkdDRT09PT09PT09PUREPURFSkpDQ11BQVJCQj9pT3hmS1GLi5p/DE8/QkFVRTpo
-Ojw5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTw7aOOCHkZgYGBgYGBgYGBgXFpa
-doFCUkdVeT09Ojo7Ozs7Ojo8Ozs7Ozs9PT1FSkNDXUFSQkI/aU9kSGKLj5qAUD9CQVU9Ojw6Pjk5OTk5OTk5OTk5OTk5OTk5OTk5
-OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5Ojs624JrRmBgYGBcXFxcXGB1dVd27mxdSj09Ojo6Ojs7Ozo6Ojo6O2g8
-aDo7PT09eUpDQ12kVkI/aU9NVIR+i3NPP0JHSkQ6Ojo+OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5
-OTk5OTk5OTk5OT46Ojs9XW5qYFxcXFxcXFxcdYODdXaOlUo9Ojs6Ojo6Ojo6Ojo6Ojo6Ojo6Ojs7PT1EPXlKQ0NdVkI/aVBJl36E
-ck8/UkNFRDw6PDk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5PDpoO60CYFxcXFyI
-XFxcXFdig4N+j96CPTs8Ojo6Ozw8PDw7PDw8Ojo6Ojo6Ojo7PUQ9PT1FVUNHVkI/UEmffIRh00JBQ0Q6PDw+OTk5OTk5OTk5OTk5
-OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OT47OjxTiQFqXIhaWlpaWlxXYWJig37HR0U7PDo6Ozw+OTk5
-OTk5OT48Ojo6Ojo6Ojs6RD09RD1FVUNBQj9QW3x8l3tjQkdfRDo7Oj45OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5
-OTk5OTk5OTk5OTk5OTk5OTk+Ojo6Oj2JtVxaWlpaWlpadVtbW3Bwfu77PTo6Ojw+OTk5OTk5OTk5OTk6Ojo6Ojo6Ojs6Oj09PT1F
-Q0dCP2RwcHyDUEJBQ0VEOzo8Pjk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTw8Ozw9
-PZ2BdlpaWlpaWlpbUVtbW3CEFhVvPDo7OTk5OTk5OTk5OTk5OTk8Ojo6Ojo6Ojo6PT09PUVDQUI/SVtbn3tjUkdKRDw8Oj45OTk5
-OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk8Ojs7Oj0dCIhaWldXV1d1W1FRUVtbfH4IRFM7
-PDk5OTk5OTk5OTk5OTk5OTk8Ojo6Ojo6Ojo6Oj09RUNBXmRRUXxRY0JBX0Q6PDw6Pjk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5
-OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTlTPDpoOzs9eYmgWldXV1dXV2FUVFFRW1t8CYlTPDs+OTk5OTk5OTk5OTk5OTk5OTw7Ojo6
-Ojo6Ojo7PT1KXV4/VFFwcFBCQUNEOjo6Ojs5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk+
-PDw6OztESl2d/AF1V1dXcldhSVRUVFFRW58JG906bzk5OTk5OTk5OTk5OTk5OTk5OTs6Ojo6Ojo6Ojo9RFVBP0lUUXBPXkFDRUQ8
-Ojo7OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk7Ojo8PFOtXwDZlj0VAVdycmJiYklJSVRU
-UVtwhAU+hjs+OTk5OTk5OTk5OTk5OTk5OTk5PDo6Ojo6Ojo8OkRFR157VFFbT15BQ0VEPDo8Ozk5OTk5OTk5OTk5OTk5OTk5OTk5
-OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTlTPDo8OlM916V4CK3cPOlXYmJhYmJJS0lJSVRRW3x+CDw6Uzk5OTk5OTk5OTk5OTk5
-OTk5OTk8Ojo6Ojo6Ozs9RUNSZklUVD9sQVVERDo6Ojs5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5
-OTk7Ojo6Ojs9gkeeDEM8Oo0561dhYWFiVEtLS0lJVFFbn8eJUzo+OTk5OTk5OTk5OTk5OTk5OTk5Pjs6Ojo6Ojw7RHlDQWZLVK9j
-bFlfRDo6Ojo7OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5Ozo6Ojs9Q6tpewCJO648byQFYnFx
-YW1IS0tLSUlUUVt+AdLcOjk5OTk5OTk5OTk5OTk5OTk5OTk8Ojo6Ojo6OkRFQ6RmS0l4bEdVRUQ6PDo8PDk5OTk5OTk5OTk5OTk5
-OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5Ozo6PDpESkdeAL8I1FM8OzuKEQlbUVFRSEhISEtLVFFbcH4FPuJTOTk5OTk5
-OTk5OTk5OTk5OTk5Pjs6Ojo6OjpERJalSEt72ZxDRUQ6Ojo6OnQ5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5
-OTk5OTk5OTs6Ojo9RVlsP1FRVolvPDo7OTkEUVRUUUhOSEhIS0lUUVt8dQs+Oz45OTk5OTk5OTk5OTk5OTk5OTk8Ojo6Ojo8RESW
-2khIAEeCRUQ6PDw6PDo7OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk6Oo06PUNBXnhwvxxfUzw6
-PjkHOQtRVFRLTk5OSEhLSVRRW37H2FM6Pjk5OTk5OTk5OTk5OTk5OTk5Pjo6Ojo8aEREQ2RODFnXRD06Ozw6PDw8Ozk5OTk5OTk5
-OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5PDo6O0VZUmN7n69sQztoOjs5OYo5IlRUSU5OTk5ISEtJVFtwfgHS
-bzs+OTk5OTk5OTk5OTk5OTk5OTs6Ojo6aDs9SqVkZKWWRD06Ojw6PDw6dDk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5
-OTk5OTk5OTk5OTk5OTw6PD1KR0JQVJevXkM9OjxvOTk5OSQMVElkZU5OTkhISVRRW3B16z7AOzk5OTk5OTk5OTk5OT4+Ozw6Ojo6
-PGhvRFlPT6WWREQ6Ojo6Ojw6PD45OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OT48Ojs9SkFCUFuX
-v15ZPTw8dDk5OYo5F1RJSE1NZU5OSEtJVFFbg3UOdDo8OTk5OTk5OTk5Pjs6Ojo6PDo6OmhTU0McT6WWPT06Ojo6Ojo6PDs5OTk5
-OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5Ozo6RFVBQlBbl1RjQUU8PDw+OTk5mDmZVEhNTU1lTk5I
-S0lUW3B+xxJvOj45OTk5O1NTOzw6Ojo6OjpoaDpTU19WPyFVRD1EOmg7Ojo6Ojs5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5
-OTk5OTk5OTk5OTk5OTk5OTk5OTs7Oj1fQT9YYpdbP1ZfOjw6Pjk5OTmoOSJLWFhNZWVOTkhJVFFbcIQFfdw6Pj5TOzo6PDo8Ojw6
-aDw6Ozs7PUpHVkdDSkVERDo6PDo6Ojo7OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk7Ojo9
-SkE/UGGXfE9eWUQ8Ojs5OTk5PjklDE5YWE1lZU5IS0lUUXCDj+s8rjs6Ojo7OuDgOjs6Ojs7PUQ9RUpDQUdDX1VDSkVERDo6Ojo6
-PDk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5PjqNO0pBQlABhJ97XkFfOjw8PDk5OTmKOSdm
-WFhYTWVOTkhLSVFbcH51DTk8PnR0OjtTOzs9REVKSkpfQ0NHR0FBQUFBQUFBR0NFPTo6Ojo+OTk5OTk5OTk5OTk5OTk5OTk5OTk5
-OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk6Ojs9R0JQwYuXcFBCWUQ8Ojo+OTk5Obw5pk1YWFhNZU5ISElUUXB8IwH+FzIED+gD
-RF9fVUNHQUFWVlZCQkJCQj8/Pz8/Pz8/P0dFOjw8Oj45OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5
-OTk5Ozo8PUNCP2Z2hIR7Y1ZVRDw6Oj45OTk5vTkWWFBYWGVlTkhLSVFbfI+iZmZLVHGAgHJyooGBgYEKgYFnZ2dnZ2dnZ2dnZ2dn
-Z2cAbEo9Ozo6OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk7PDtKVj9NcpqEg1BCQV89Ojo6
-Pjk5OT45JQBQWFhNZU5OS0lUUXx+7FBNTkhJVFFhYld1dnZ2dn9/f1xcf2pqakZGRkZGQEBAAT9BRTo8PDw5OTk5OTk5OTk5OTk5
-OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5Pjo7PVlCT0t/diNRUD9BX0Q6Ojo+OTk5PjlvT1BQWE1lTkhLSVF8CU/T
-TU1IS0lUUWFiV1dXdVpaWlp2dlxcXFxciG5uTExMQGtjUkM9PDo7OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5
-OTk5OTk5OTk5OTlTPDtKQT9PgGqPi0lQP1ZDRDw6Ojw5OTm8OQtNUFhYZWVOS0lRYuFjUE1NZEhLSVRRYWJiV1dXdXVaWlp1V3Nz
-c3OIiG5uTEBnP0JHRTs8PD45OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OVM6PVVWP2Rzao+L
-wVA/UkNFOnQ6Ojw5Oaw5CFBQWE1lTkhLUQlpY1BQTWRISEtJUVFhYWJiV1dXV2JhgICAcnJXc3OIiG5MenheQUpEPDo8OTk5OTk5
-OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk+Ojo9WUI/SHNGmotxWD9CQVVEOmg6Ojs5PhHaUFhYZWVO
-S1EAY2NQUE1kTkhLSUlUUVFhYmJhUVRtcXFxcYCAcnJXc3OIXEYAY0FVPTs8Oj45OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5
-OTk5OTk5OTk5OTk5OTk5OTk5OT46OkRZUj9kckB/mnVOUD9CR19EOjo6PDo5A09QWE1lTkuvaWM/UFhNTU5IS0lJVFFRVFRJS0tL
-SUltbW1xcXGAcnJXWohGxGNSQ0U9PDw8OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5Pjs6
-PUNBP09URmqai2FYUD9eQUNFPTo8jTmmT1BYWGVLnl5jUFBYTU1OSEtJSUlJS0hOSEhIS0tLS0lJbW1xcWFicldaf6FjUllFRDs6
-Oj45OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTlTOjs9RV1SP2SAQH+Pi2FN0z9eQUNKRDo7
-OVlNWFhOe2ljP1BQWE1NTkhISEhOZWVOTk5ISEhIS0tLSUltbW1xYWJXV3/3Y1JDRUQ8Ojo7OTk5OTk5OTk5OTk5OTk5OTk5OTk5
-OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTw6Ozs9SkFCaWSARn+PhGJLTWNebEFDX0UDMFhYSJ4/Y1BQUFhNTk5OTU1NTU1l
-Tk5OTkhISEhLS0tJScFtcXFhYld2gT9BQ0VEPDo6PDk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5
-OTk5OTk5PDo6OzpEVUFCaWRJ93+ahJ9bSWRQY15slUFNTWZPY1BQWE1NTU1YWFhYWE1lTk5OTkhISEhIS0tLSUnBbW1xcWFXdgoc
-lUpEOjo6Ojs5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk+Ojo6Ozs9SkdSP1BNSG1y
-g3x8W1RJS2ZNZlRJZE5OTmVlTU1NTWVOTk5OSEhISEhLS0tJSUltbW1tcXFhYXJXc3MBgok9RDo6Ojo+OTk5OTk5OTk5OTk5OTk5
-OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk7Ojo6Ojs9RUNBQj8/P1BPeGZmZmZmZE1mnk8WFllZXV1dCKam
-p6enp6enmZmZmZmZmR/GxsvLy8vGxoyMEBAZDZs7Ozo8Ozs6Ozk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5
-OTk5OTk5OTk5OTk5OTk5OTk7PDo6Ojw6PUVDR1ZSUkJeXmxsbKuVlZyc1xU6bzk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5
-OTk5OTk+qDo8Ojo6PDs5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5Pjs7
-Ojw8Ozs9RV9VVUNVVVVKRUQ9O1NTO2g8aKy8vL2srKy+vr6+B5iYmJiYmJiQF5CQkJCQkJDytra2trG9Ojs7Uz45OTk5OTk5OTk5
-OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OztoPDo7Ojs7Ozs7Ojo7PDw7aDw6
-PD45OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5
-OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OT5Trjo6jTw8PGg6Oo0Vrjs+Pjk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5
-OTk5OTk5OTk5OTk5OTk+PlM8PDtTPjk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5
-OTk5OTk5OTk5OTmHd3cuOT4+Uzs8Pj4+OTk5dy+5OTk5OTk5OTm5Lzc5OTk5d3ctdzk5OTk5OTk5KXe5Pjk5OTk8hQQE7YWF7QQP
-7eg5OTk5LHf0ijk5OTk5OYe6uoc5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5
-OTk5OT45OTk+OTk5OTk5OTk5OW85OW85OTlTwDk5OTk5OQM5OTlvPjk5O1M++vq7u7s+Pj45OTo5OVM5OTlvDTk5OTk5OTk5OTk5
-OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OYc56aqqGDnMOTk5OTk5OTl3OTaqFOg5Pjk5OTkREKoqETl3
-PCCqEAc54jk5OT6FPh8Ut2hvPt08Ere4uLi4uM7OzhQg1qg7vYwUjBI+BD45NTmzqjjlObE5OTk5OTk5OTk5OTk5OTk5OTk5OTk5
-OTk5OTk5OTk5OTk5OTk5OTk5uTkZQECjObk5OTk5OTk5OTk5CkBMwzl3OTl3OQ1MQCs5d/KTGkBACpbghjw8kD4fGkBAwjnAOxIK
-QEBAQEBAQEBAQJJ98jsDekBACuY5LLG6OaNAQAI58Tk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTm6OclA
-QKM5KDk5OTk5OTk5OX2RQEyFOTk5OS45A0xAkn3MhZORQEBAktiG36g+JkxAQEDIPsM5GEBAkh60tLS0tKEGs3SGO996QEBATLc5
-OQQ5o0BADjmHOTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5Obo5yUBAozkoOTk5OTk5OTk5fZFATA85OTk5
-OT7DTEAGffDFk5FAQEBABvwDPuZ6QEBAQAI+Dz6MQECwz15e0M/P+dQ+Ozs7B3pAenpAQBQHPjn2QEwOOYc5OTk5OTk5OTk5OTk5
-OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5tjnJQED2OQ2KPjk5OTk5OTmTkUBMwz7MlDl3Pg9MQAZ95MU5kUB6zUBAzR0LekAa
-zUBAAj4EPoxAQLC1iFpaWlqipsU6OzsHekDzDhpAQGezObdMTMg5hzk5OTk5OTk5OTk5OTk5OTk5OTk5Ojw+OTk5OTk5OTk5OTk5
-OTk5OTmHOQJMRqNv5FPdioqKOTk5d32RQHoPOfAXJ+9vPXpAK5Pw75uRQHpHa0BGBpJAQBMCQEDCPik+jEBMsAlXV1eDgwlDMzo7
-dI1uQGubX5FMTEyjyExuyDmHOTk5OTk5OTk5OTk5OTk5OTk5OTk6Oj45OTk5OTk5OTk5OTk5OTk5OYc5yUxMoJsSlJuUlJR9mzrj
-fRBGeguTlH19+PgLekBrm8Xj0mtAbl2cqUZMTEzn+R5ATMLYA7uMRkwA0GPQXmxsG/50Ojs7aGdG8xF3OSpnTG6pbm4OOfE5OTk5
-OTk5OTk5OTk5OTk5OTk5OTo6Pjk5OTk5OTk5OTk5OTk5OTk5hznlbmBna6mpa2upawqMPoU5IExgkmtra2trawZMRgX9O9vU80xn
-pIJBqUBGE2yVskx6Ah09rQJMTJL1a2tra2traxnRqDrABkyhfS2FOeUGbm5nZwI58Tk5OTk5OTk5OTk5OTk5OTk5OTk5Ojo+OTk5
-OTk5OTk5OTk5OTk5OTk575MZbm5MTExMTExMRs45qDvWzWBgTExGRkxGTGD1gj1Eefv1RmdWVlI/oY5eQmyOTEwTgkV5R6FuTExM
-TExMTGBGoZPkOt/3TLV9OTn0OX0QZ25nDjmxOTk5OTk5OTk5OTk5OTk5OTk5OTk6Ozk5OTk5OTk5OTk5OTk5OTk5OTk5htHmt6Cg
-ysrKoKCgszw6PIrRwgXK6rLq546yAEFHQ4JHq7ATAD9eQj9jYz8/Y2mOjmnVR0dHVt6Ojo7nsrLqBQUm1js8jRj2s293OTk0zDnp
-jBg5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTs5OTk5OTk5OTk5OTk5OTk5OTk5OTmUbzk5Pj4+Pj4+Pjk5Ojo8Oj2tiYIbnJyrbGxe
-Pz8/Pz9pT09kZmZ7SW1tSUtmZE1PTz8/Pz8/Xl5ebKuVnIKJ/Tw7PDw6OTk5dDk5OTk5dzk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5
-OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk+roaGhYWFhoaGhjs6Ojo8Oj09REpKpkNZXUFBVlZWPz9pT09PZGZme3tmZnhPT09p
-Pz9WVlZBpF1ZQ0pKPT09Ozo6PDvihQc5OTk5OTk5sfQNOTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5
-OTk5OTk5Pj4+Pj47Ozs7Oz47Ozo8Ozs6O1NTOz09PUVFVUNHR9VSUkJCQj8/P15CQkJSUtVBR0NVSkQ9PTs7Ozo8Ojw6Pj45OTk5
-OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OT48
-Ojo6Ojw6Ojo8OjpEREVKVUNHR0FWVlZWVkFBR1lDVUpFREQ6Ojw8PDw8Ojo7lDk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5
-OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5PlM7Ojo6Ojs8PDw6OkREREVKX1VD
-Q0NVVUpFRURERDo8Ojw8Ojo6OlM+OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5
-OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk+Uzo6PDo6Ojo8Ojo6OkREREQ9REREPTo6Ojw6PDs6PDw8Oz45OTk5
+OTk5OTk5OTk5OTk5OTs7OkU6PDo6Qzs5Ozk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5
+OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTs7OTk5OTk5OTk5OTk5OTk5OTk5OTk5OztDRUc6OjpFOjpD
+Ozs7OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5
+OTk5OTk5OTk5OTk7Ozs6OkU6OkM7OTk5OTk5OTk5OTk5OTk5OTk5OTs7Okc6Ojw8PDo6Ojs7Ozs5OTk5OTk5OTk5OTk5OTk5OTk5
+OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTs7O0U6Ojo6PDw8OkU7
+Ojs7OTk5OTk5OTk5OTk5OTs7Ozo6Ojo8PDw8OkU6Ozs7Ozk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5
+OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTs7Okc6Ojo6Ojo6Ojo8OkU6Ojs5OTk5OTk5OTk5OTk7OztFOkc6
+Ojw8PDw6O0M6Ozs7Ozk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5
+OTk5OTk5OTk5OTk5OTk7Qzo6Ojo9QT09PT09PTw8OjxFRTs7Ozs7Ozk5OTk5Ozs6Rzo6Ojo8Ojo6Ojw6OjpDOTs7OTk5OTk5OTk5
+OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5Ojw6Ojo9PT09
+RklJRklGPT06Ojo8RzpDQ207Ozs7OTpFR0c6PDw6Ojo8Ojo6Ojo8OkU7Q0M7Ozk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5
+OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5Ozo6Ojo9PT1JcERhYECMQGBERj09Ojw6Rzo6bTs7Ozs7
+OkdFOjo6Ojo8Ojo6Ojo6Ojw8PEU6Ojs7OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5
+OTk5OTk5OTk5OTk5OTk5OTk5OTtFOjo6fj1GcERgQFJCQkJCUoxEXT1BOkU6PDo6Qzs7O548Ojw6Ojo6OkFBOjo8Ojo6Ojw6PDw6
+Ozs7Ozk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk6PDw6
+Oj1GcERgQFJCXFxnwo8+UkRJPT06Ojw8OkdFPDw8PDo6Ojo6PT09PT09PT09PT09PDw8Ojo6OkM7OTk5OTk5OTk5OTk5OTk5OTk5
+OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5Ozw6Oj09Sb5hQFJCXFxnkHNIwj5SYHA9PT06
+Ojw6Ojo8PDo6Ojo9PT09PT09PT09PT09PT09PUE8Ojw6RUNtQzk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5
+OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTtFOjo9PV1EYGNCXFxnkLZIP25nQlJgSV09PTo6Ojo6Ojw6PT09PT1GSUZGRklJSVpa
+WlpaSUY9PUE8Ojo6PDpDOzk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5
+OTlDRzo6PV1JRIxSQlxcwrZIPz8/yVxCUmBwRl09PT09PUE9PT09XUZGSURERGBgUEBAQEBAQEBQYURGRj09QTo6PDpDbTk5OTk5
+OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OUc6Oj1dcGBAQkJcj8lRPz8/Pz8A
+PkJjYXBdXT09PT09RkZGSURwYVBQQEBSQkJCQkJCQkJCQkJSQFBEWkY9QTo6RzptOTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5
+OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk6Ojo9Xb5g2kI+ZwBRPz8/Pz8/SI8+QkBhRElGRkZGSUlaWkRhYFBAUkJC
+QkI+Pj4+Pj4+Pj4+Pj5UUkBQREZBOjw6OkU5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5
+OTk5OTk5OTk5OkU6fl1EjEI+XACJPz8/Pz8/SD9uXEJSQGBEWnBaRERERFBQQEBSQkI+Pj4+U1lZWU9PT09PT1lZUz4+QkBQREZB
+Ojo8RTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk6PDo93oxCXA9uPz8/
+Pz8/SEhIP8k+QlJAYGFERERhYWBQQGNCQkI+PlNTU1VPT01KSkpMTExKSmlPWT4+QmOLWj09PDpFQzk5OTk5OTk5OTk5OTk5OTk5
+OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk7O0c6PQNAQglxPz8/Pz8/SEhISEhIDz5CUkBQUFBQYVBQQFJU
+VGg+U2lsTnRfcnJzc3Nbc3NztpF0F0ppT1M+QkBERj06OkdDOzk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5
+OTk5OTk5OTk5OTk5OTk5OTs6Oj1dQKfyPz8/Pz8/SEhISEhISEhnPkJSQEBAQEBAsVRCPllpek5WV19fX2ZyWFh3f4NkSD8/P1GZ
+AExNT1M+VEBERkE6Ojo5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OjxHfkTh
+UT8/SEhISEhISEhISEhkcVw+QlJjQLFSYz4+WWdnZ2dnXFw+PlNTU1lPaWyQV3Z7d2RIPz9ItkxNWT5CUotGQTo8RTk5OTk5OTk5
+OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk6OkfDQPI/SEhISEhISEhIZGRkamTIPj5CQkJC
+Pj4+WdpjY29vb29vQkJCQj4+XFxZZ2dsepBXeKJkZGRImUxPUz5UUGtBOjpHOzk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5
+OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OUNHfl0fUUhISEhISGRkZGRkZGJiZCM+Pj5CPmP4YWFERERacHBEYWFgUEBAQFJCQkI+
+XFxnZ2x6VmZ/f4NktmlZPlRAWkZBPEc5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5
+OTk5QzrgRKFISEhISGRqampqamRiW3diZz5jQFBERkE9PT09PUFBQT1GRkZJSVpEYWBAQFJCQlxcZ2dseld/f3+Dl1k+VEBaQUE8
+Rzk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTlFOgf3MEhqampqampqampqYltb
+d3NCUmBaRj09QTo6Ojo6Ojo6Ojo6Oj09PV1JcERhYIxjQkI+XGdpSoaSon+RVT5CQEk9PDxDOTk5OTk5OTk5OTk5OTk5OTk5OTk5
+OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5O5Y64FAKSGpqampiYmJiamJ8fHx3yG9gWkE9Ojw6PDo8PDxFPEc8PDo6
+PD09PT1dXXC+YWBAY0I+XFlPVoJ7klhPPlJQST08Ojs5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5
+OTk5OTk5OTk5OTk6PDo9YG5kamJiYmJiYmJiWIZYhneHnUk9PTo6OkNDOjo6Ojo6Qzo6R0U8Ojw6PT09XUlwRGFAY0I+XFlOe3uC
+WFM+UkRGPTw6OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5O0M6R47lamJiYmJi
+YmJiYlhmhoZ7W+F9PTw8R0M6Ozs7Ozk5O0NDOzpHOjo6Ojw9PT09XV1JcERgY0I+U1a0eIJfU0JAREFBPEU5OTk5OTk5OTk5OTk5
+OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk7PDrggQhkgICAW1tbW2JYX2ZmZnsAQEY9PEdDbTs5OTk5
+OTk5OTk7OkU6Ojo8PDo6PT09PV1GcGFAQj5TV3h4n3poQlBJPTo8Ojk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5
+OTk5OTk5OTk5OTk5OTk5OTk5O0c6On6BJWJbW1tbW1t3W15eXnZ2ggD2fjqNOzk5OTk5OTk5OTk5OTk7OztFOjo8PDo9PT09PV1J
+REBCPml2dnh4Uz5ARD09OjxDOTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTlDOjo9
+PUmAd1tbW1tbW1teV15eXnaCIoF+OkU5OTk5OTk5OTk5OTk5OTk7O0M6Ojw8Ojo6PT09PUlEQEI+Tl5etHpoQlBJPTw6Ojs5OTk5
+OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5Ozo6QT1rGVtbW1hYWFhbX1dXV15eeHsfjjpF
+Ozk5OTk5OTk5OTk5OTk5OTs7QzpHOjw8Ojo6PT09RkRAVGdeV3hXaFRAWkFBOkU7OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5
+OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OY08Oj09XYHLW1hYWFhYfF9WVldXXl54WH09PEM5OTk5OTk5OTk5OTk5OTk5OTttOkM6
+Ojo6Ojo6PT1JYW9cVld2XlNUQERGQTw6Ojk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5
+OUPYOkdBRmFJ2Qh8WFhyclhfTlZWVldXXrQA9UM8OTk5OTk5OTk5OTk5OTk5OTk5Ozs7Q0VHRzo6OjxBRnBAPk5WXnZZVGNEQUE8
+Ojo5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5O23YPEOOa9vbST1BEVhycmZmZk5OTlZW
+V152ewi8eTo5OTk5OTk5OTk5OTk5OTk5OTk5OztDOjo6PDw8QT1JUFR6VldeXFRAREFBPDw7OTk5OTk5OTk5OTk5OTk5OTk5OTk5
+OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OzrARUNBfYzd20FHngVYZmZmZmZOTE5OTlZXXnh7A446OTk5OTk5OTk5OTk5OTk5
+OTk5OTk5O0M6Ojo6OkFBXURvbE5WVj5vQFo9QTw6Qzk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5
+OTk7O0U6PDo9fZ2P3VqOOqA7MlhfX19mVkxMTE5OVldetFiBOkU5OTk5OTk5OTk5OTk5OTk5OTk5OztDOkc6Ojw6QUZaQGxMVpBU
+b4trQTw8PEU7OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTo6PDo9RJ1cet2BOrM6BzkzZl91
+X1ZKSkxMTk5WV3Z7AAtDOTk5OTk5OTk5OTk5OTk5OTk5OTk7QzpHPDw6OkFGRIxsTE5nb1BE+0E6PEU7Ozk5OTk5OTk5OTk5OTk5
+OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTs6PDpBSUBUj8W/vUfAOzttOABfV1dXSkpKSkxOVldednsIOwc5OTk5OTk5
+OTk5OTk5OTk5OTk5OztDRTo6OjxBRmuySkxs2pxERkFBPDxFOjs5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5
+OTk5OTk5OTk6OjpBQVBvPlfFY70HPDo7bTkkX1dWV0xNSkpKTE5WV154fBmepDk5OTk5OTk5OTk5OTk5OTk5OTk5Ozo8Ojo8PT1E
+v0pKv1B9RkE6Ojo8PEU7OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5Ojw8PVpAVGd2xW9rRylD
+Ozm1OQR1VlZMTU1KSkpMTlZXXoZY+To5OTk5OTk5OTk5OTk5OTk5OTk5OTtDRzo6PD0LRGlK/mC9QUFBOjo8PEU7Ozk5OTk5OTk5
+OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5Ozo8PT1hUmh6tJCvRD1FOjk5OcY5IVdWTk1NTU1KSkxOVl52ewiU
+xjs5OTk5OTk5OTk5OTk5OTk5Ozs7O0c8PEE9RrJpabJrQT06Ojo8PDo7Ozk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5
+OTk5OTk5OTk5OTk5OTtDPD1GUFRTVp+Qr4s9PEc7OTk5OzkMVk5NZU1NTUpMTlZXXnaiBDu1Ozk5OTk5OTk5OTk5OTk5Ozs7OztF
+PDw9QVpPTyxrQT1BPDw8OjpDOzk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk6PDo9SUBUU16f
+kFRQPTw6Ozk5OW05JFZOSk9lZU1NSkxOVldehnznsKQ7OTk5OTk5OTk5OTk7OztDOkc8PDw6R2sVWbJEQT1BPDxFOkc6Ozk5OTk5
+OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5Ozo6PUlAVFNeGMVoQEY6szs5OTk5tTkEVkpPT2VlTU1K
+TE5WXnZ7EbxHbTs5OTk5OTk5O207Q0M8Ojw6Ojw6R2v4Y7JrRkFBQTw8PEdDOTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5
+OTk5OTk5OTk5OTk5OTk5OTk5OTkHPD1JQGhVZp9ePhVrQY1tOzk5OTlDOSBMT1VPZWVNSkpMVldedoIIOwU7OTk5OTs7O0U6OjpF
+Ojw8PDo9PUZQY0BESUZBQUE6OjpFOm05OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5Ozw9
+SUA+U1+feFlUYT08Ojs5OTk5OUM5IU1VVU9lTU1KTE5WXnaGosqe721tOzqNOjo6PDo6Oj1+fj09PUlEYEBEcERESUY9QTw6Ojo7
+Ozk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OUU8QUZAQlN1GJ96aEBrQTw7Ozk5OTltOYh6
+VVVVT2VNTUpMTldednt8EDs7Ozs7OkNHOn5+PT1Ja2tERERQQEBAQEBAQEBAUERGPTw8Rzs5OTk5OTk5OTk5OTk5OTk5OTk5OTk5
+OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTlDOkE9UEJTl5KfdlNUi0E8PDs5OTk5OcE5A09VVVVPZU1KTE5WV3Z4GBH8BwWoBRAC
+Ax59fVBQQEBSUlJCQkJCQkI+Pj4+Pj4+QlBJQTo6bTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5
+OTk5OTo8PURCPmx3goJsaFJaQTw8Qzk5OTk5ljneVVVVVWVlTUpMVldeeIJyF0pOdHVycnNzc3OZzs7OmZmZmXFxcXFxcXFxcXFx
+cXFnb1o9PDpDOzk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk7PDpJYz5Pcn+ChlU+QFpBPDxD
+OTk5OTk7OdxVVVVVZU1KTE5WV3h7F1NPTUpOVnVfZlh8d3d3f4ODg4NkZGRkZEhISEg/Pz8/AGhASTo6Rzs5OTk5OTk5OTk5OTk5
+OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OUM6PWBCWU6Dd5J1u0JAWkE8R0M7OTk5OzkHT1NVVWVlTUpMTld4DFm7
+T2lKTE5WdV9mWFh8fFtbW3d3d2JiYmKAgG5uiVGJPwpoUlpBOkU7OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5
+OTk5OTk5OTk5OTk5Oj1JQD5ZkWSikpdTPmNaPTw6Ojs5OTnBOQJPU1VVZU1NTE5XZgloU09PaUpMTlZXX2ZmWFhYfHxbW1tbc3Nz
+c3OAgG5ubj9xPkJQRjo8RTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTtFPURSPmlzZHeS
+l1M+b0RGQTw6Ozk5OZY53lVTVS1lTUpMVwxcaFNTT2lKSkxOV1dfX2ZmWFhYWHKRX5FycnJYc3OAgG5RiWdUQEZBPEU7OTk5OTk5
+OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5Rzp+YUI+bFtIf5J1VT5UQGtBQTw8Ozk5OzncVVVVZU1N
+TFfCVGhTU09pTUpMTk5WV15fZmZfdXR0dHV1X5GRcnJYc3OAYkgJVEBEQTo8RTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5
+OTk5OTk5OTk5OTk5OTk5OTk5OTlHOj1EUj5pcj+Df3xlUz5CUGtBQTxFRdY5Lk9TVVVlTUyQXGhTU1VPT01KTExOVldXV1ZOTExM
+Tk50dHR1dV9fcnJYW4BkI2hSREY6PDw7OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTo6
+PURAQllWSGR3kl9VUz5UQGtBQTxFjTkCT1NVVU1Mj2hoU1NVT09NSkxMTk5OTEpNTUpKTExMTk6XdHR1dV9yclhbZMhoUotrPTw6
+Qzk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5RTpBXWFCXGmRP4Oikl9Puz5UQERrPTw8
+Ov1VVVVNelxoaFNTVU9PTUpKSkpNTWVlTU1KSkpKTExMTk6XdHR1X2ZYWH8KaFJhRkE6PDo5OTk5OTk5OTk5OTk5OTk5OTk5OTk5
+OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTs6PD09SUBCXGmRSIOigmZMT2hUb52La0FB/lVVSo9oaFNTU1VPTU1NaU9PT09l
+TU1NTUpKSkpMTExOTnR0dHVfZlh3mT5AREY6PDo6OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5
+OTk5OTk5OTs8PD09cEBCXGlOc4N/gnteTmlZPlRvlUBPT2xZaFNTVU9PT09PVVVVVU9lZU1NTU1NSkpKTExMTE5OVnR1dV+Gd84V
+nElBQTo6Qzk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTpFOj1BSVBCPllPbABy
+hnh4XldOTGxpbE5MTWVNTWVlT09PT2VlTU1NSkpKSkxMTExOl5d0dHR1dXVfX2ZYfIASfYFdQUE8OkM5OTk5OTk5OTk5OTk5OTk5
+OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTo6Ojo9RkRAQj4+u1NZZ49sbGxsaWlpj1m/3P1wWnBJA13D
+w8MDAwMDIOTk5MfHx8fKysoEBM3Pzxwcz8+4NKY6Rzw8Ojo7OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5
+OTk5OTk5OTk5OTk5OTk5OTk5OUNFRTo6PUZhQEBSQlRUVG9vb5WVnZycfYGORTs5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5
+OTk5OTk5iALAOkdDOTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTlD
+Q406Oj09RmtaREREWmtrRkFBPT06OjpFO5aWljo6OpY6OsTExMQWFnl5eXl5eXl5xpOTk5OTk5PviEs5Ozk5OTk5OTk5OTk5OTk5
+OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTrBOzo6Rzo6PDw6Ojo8Ojw8jTk5
 OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5
-OTk5OTk5OTk5OTk5OTk5OTs8PjlTOzo6Ojs6Ojo8Ozw8PDo6aDw6PDo6OjtTPjk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5
+OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk7O9/fOTk5OTk5OTk71jk5Ozk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5
+OTk5OTk5OTk5OTk5OTk5OTk5Ozk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5
+OTk5OTk5OTk5OTlLS0tLOzs5OTs7Ozk5OTk5pUsGOTk5OTk5OTlLS6s5OTk5S0tLSzk5OTk5OTk5S0tLOTk5OTk5iAap6eqTqKhL
+E4g5OTk5S0tLNzk5OTk5OUtLS0s5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5
+OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk76zk5OTk5Oas5OTk5OTk5OTo7O5SUlJSUOzumOTo5OTk51zltOTk5OTk5OTk5OTk5
+OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OUs5ExSuGzmjOTk5OTk5OTlLOfOuDg05Szk5Szk1Dq4cO0tL
+OfOuDj1F6zk5OTmTO+6umkUQOUs6jtKbrNHR0dEd0xQBRUs5lh2b09g7iDk5ozkbrhQ2Oes5OTk5OTk5OTk5OTk5OTk5OTk5OTk5
+OTk5OTk5OTk5OTk5OTk5OTk5SzkOPz+5OSY5OTk5OTk5OUs5hD+FDTlLOTlLORaFP7o5SxM5FD8/1IE6Ajk5S6btPz8/7jmrS43U
+Pz8/Pz8/Pz8/P4TXSzn8hT8/1QQ7iEtLObk/P/M5pTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTlLObg/
+P7k5Jjk5OTk5OTk5Szm6P4UNOUs5OUs54oU/ujlLSzu6Pz8/1Pmgs3k77oU/Pz8BOwY5AT8/JaqYmKqqqresBUUFQ0GFPz8/P5o5
+ORM5uT8/0DmrOTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OUs5AT8/uTlLOTk5OTk5OTlLOYQ/hQ05Szk5
+SzkNhT+61zGoO4Q/Pz8/hAt+nhmFPz8/P+07qTsdPz+nr1RUVFRvlStFPAtDQYU/iVE/P4TiOUsOPz/QOas5OTk5OTk5OTk5OTk5
+OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5Szm4Pz+aOUs5OTk5OTk5OUs5hD9REDlLOTlLOQJRP4Q76nk7hD9Rtz8/rPUDUT+F
+tz8/7TvpO9M/P6fJYltbW1sRvkezo209UT+3L9U/P9UBO9JRUdA5pTk5OTk5OTk5OTk5OTk5OTk5OTk5Ozs5OTk5OTk5OTk5OTk5
+OTk5OTlLObhRSM2w6KCko6OjS0s5SzmEP1ECqBuoiKl54ok/hDt56TuEP1FQtz8/qnE/P6HlPz8EvKA70z8/pwx8WFhYWAxEQ7Oj
+Oj3VP/Q7SZtRUVHSAYmJ0DmlOTk5OTk5OTk5OTk5OTk5OTk5OTk7Ozk5OTk5OTk5OTk5OTk5OTk5OUs5uFFRzTtFOzs7OzvWOUNL
+OfRIiec7pqY7sDvnUT/0O6CglJs/iWD3Cj9ISEgPJw8/URqOApQSSFGnr1RUVK8oKr2ePHk6Am5RrLB5OdJuUW6Kbm4BOaU5OTk5
+OTk5OTk5OTk5OTk5OTk5OTttOTk5OTk5OTk5OTk5OTk5OTk5Sznwbm5xioqtra2trdSaOwY5mlFucYqKioqKCq1RSMy8PT3ZrFFx
+jItA8khRh5VAoVGJ5ft+jhpRUQqYmJiYmJjx8RI6BTrjilGspoiIOwWbbm5xcQE5pTk5OTk5OTk5OTk5OTk5OTk5OTk5R0M5OTk5
+OTk5OTk5OTk5OTk5OTk5SzkSbmpRUVFRUVFRSJs5BnkLm25RUVFRUVFRUVGqfUY9XR7xSG5jY1JCyIdUQm+HUVEJfV1dfQBuUVFR
+UVFqampIijnonuhuUZs5iDlLOTmacW5x8DmkOTk5OTk5OTk5OTk5OTk5OTk5OTlDOTk5OTk5OTk5OTk5OTk5OTk5OTk5SzsEAQHL
+zMzMy8vNBjo6PDqwBOzs7CLmoaGhCZ1QRH1QlaeHCT4+Pj5oaD4+PlyHhz6xUFBQleGHh4eHoebmGggERTo64wGaBjlLOTmkSzkG
+mvA5Szk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5xjs7Ozs7Ozs7Ozs7Rzw8Oj36gYF9nJxvb1RU
+Pj4+Pj5cWVlnbGx6TnR0TnpsaVlZWVw+Pj4+VFRUb5WdnPaB+tlBOjo6OTk5OTk5OTk5pTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5
+OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5tanqtampB3l5oONHPDw8PD09PUFGSURhQEBAY2M+Pj5cXFlnZ2x6enpsbGlnWVw+
+Pj4+Y2NAQGBEcElJQT1HOjxFO8EFBqQ5OTk5OTk5pO+rOTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5
+OTk5OTk5OTk5OTk5OTk5OTk5OTltRTo8Rzo6PT1BQUZJWkRQQLFSQlRCPj4+Pj5CQkJUUrFAUEREa0ZBPT1HRzxDQzo5OTk5OTk5
+OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5Ozs7
+QzpHwDo8PDw6PT09PUZGcERgQEBAUlJSUmNAUItERElGQUFBQTo8OjxFOt87Ozk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5
+OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5Ozs6PDo8PDo8PT09PUZGSVpE
+RERERGtGRkFBQUE8PDo8OkU7OTs5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5
+OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5Ozo6OjpDRTw6PDo6PUE9QT09PT09PUE8PDw6PDw6OkVDOTk5OTk5
 OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5
-Pjs8Ojo6Ojo6Ojo6Ojw6Ojw7Oz45OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5
-OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk+Pjs7UztTU1NTUz45OTk5OTk5
+OTk5OTk5OTk5OTk5OTk5OTk5OTs5OTtDPDw8PDo6Ojo8PDw6Ojw6RUM6Om05OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5
 OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5
+OTk7Qzo6Q0U6R0cCjTo6OkM7OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5
 OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5
 OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5
 OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5
@@ -1331,41 +1551,43 @@ OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5
 OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5
 OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5
 OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5
-OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTs8dDk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5
 OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5
-OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5Ozw8Ojo8Oz45OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5
-OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5PjxT
-Ozo6Ojo6Ojo6Ojk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5
-OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk+Pjs6Ojw6PDo6Ojo6Ojo8OTk5OTk5OTk5OTk5
 OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5
-OTk5OTk5OTk5OTk5OTk5OTk5OTk5O3Q6Ojo6Ojo6OjpEOjw6Ojo6Ojk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5
-OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk+Pjw6
-Ojo6Ojo6O1M7REQ6Ojw6Ojo5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5
-OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OW87Ojo6Ojo6Ojo8PDo7PUpFREQ6Ojo6Ozk5OTk5
 OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5
-OTk5OTk5OTk5OTk5OTk5OTk5OTk5Pjs7Ojo6Ojo6Ojo8Ozs7PUVDVUVEREQ6PDw5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5
-OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5Pjo6
-Ojo6Ojo6Ojs6PDo6PUVDR1lfRURERDo7Pjk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5
-OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5O3Q7Ojo6Ojo6Ojs7Ojo9PT1FR0FHQ19FRUQ7
-PDs5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5
-OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTs6Ojo6Ojo6Ojw6Oj09PT1FQ0FSQVlDX0VFOjw7OTk5OTk5OTk5OTk5OTk5OTk5OTk5
 OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5
-Pjs7Ojo6Ojo8Ojo8Oz09PT1FQ0dSQlJBXUNVRTpTPD45OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5
-OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk7Ojo6Ojo7PDs7PT09PURKVUNBQkJC
-VkddQ19EOjo6Pjk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5
-OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTo6Ojo8Ojs9PT09eUVKQ1lHUj8/QkJBQUdDRDw6Ojo+OTk5OTk5OTk5OTk5
+OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTs6OkM7Ozk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5
 OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5
-OTk5OTk5OTk5Ojo8PDs7RD1ERUpVQ0dBQUI/Pz9CUkFBWUQ7Ojo6Pjk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5
-OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk6PDo9PT09RUpDQ11B
-VkJCPz8/QkJSQUdFOjw6Ojs5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5
-OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTo9PT09RV9DWUdBQVJCPz8/Pz9CQlJBXz06Ojo6OTk5OTk5
+OztFPDo6R0NDOzk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5
+OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk7O0NFPDo6OjpHRTo7OTk5OTk5OTk5OTk5
 OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5
-OTk5OTk5OTk5OTk5OTk5OTk5PT09RV9DQ11BQVZCQj9PTz8/P0JCVkM9Ozw6Ojw5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5
-OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTl5RUpD
-Q0dHQVZCQkI/T08/Pz8/QlJDPT06Ojo7Pjk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5
-OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OUpDQ1lHQVZCQkI/P09PTz8/Pz9CWXk9Ojs6
-Oz45OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5
-OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5Q0NdR0FWQkI/P09NTU9PPz8/P0dKPT06Ojo6OTk5OTk5OTk5OTk5OTk5OTk5OTk5
+OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTs7OztDQ0U6PDw8PDw6RzpHOzk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5
+OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTs7OTtD
+Qzs7Qzw6PDo6QUE9PDw8Ojo5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5
+OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5Ozs7Q0M6Ojw8Ojw6PUZGQUE8PDxDbTk5OTk5
+OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5
+OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5O0M7O0U8PDw6Ojw9PUZaREY9QUE8PDs5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5
+OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTs7
+Ozo6Qzo8PDo6PDxBPT1EUERaRkZBPTo6OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5
+OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk7QzpFRzo6Ojo8Oj09PT1dUEBQRFpGRkE8
+Rzs5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5
+OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk7O0U6RTw6Ojo6PD09PV1JREBSQFBEWklBPEc7OTk5OTk5OTk5OTk5OTk5OTk5OTk5
+OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5
+OTk7O0U8Ojo6PDo6OkE9PV1GWmBSVFJAUERaRj06RTs5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5
+OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk7Q0c6Ojo8PDo6PT09PUZJRERAQlRC
+Y0BQREk9PDo7OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5
+OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTw6Rzo6OjxBPT09XUZwRGFAQEI+QlJAQGBEQTpHOzs5OTk5OTk5OTk5OTk5
+OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5
+OTk5OTk5OTk5Ojo6Oj09PT09RklaRFBAQEI+PkJCUmNAYT06Okc7Ozk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5
+OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk8PEE9PT09RklERGBA
+QEJCPj4+QkJSY1BJPTxFQzs5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5
+OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTpBPT1GSVpERFBAQFJCPj5TPj5CQlJAST08Ojo7OTk5OTk5
+OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5
+OTk5OTk5OTk5OTk5OTk5OTk5PT1GRnBEYWBAQGNSQj5TWT4+PkJCY0Q9QTxHOjs5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5
+OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTldSUlE
+RGFQQFJCQkI+WVlZPj4+QlJEPT06PEM7Ozk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5
+OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OUlaRGFQQGNSQkI+PllZWVM+Pj5CUF09OjpF
+Ozk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5
+OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5RERhYEBAUkJCPllZT1lZPj4+QlBJPT06PEU7OTk5OTk5OTk5OTk5OTk5OTk5OTk5
 OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5
 OTk5OTk=
 ]==]
@@ -1444,66 +1666,17 @@ OTk5OTk=
 		return nil, ok and "getcustomasset returned nothing" or tostring(result)
 	end
 
-	-- Route 2b: download CONFIG.LogoUrl once, cache it, load it. Returns
-	-- asset, pixelWidth or nil, reason.
-	local function fromUrl()
-		local url = CONFIG.LogoUrl
+	-- Route 2b: CONFIG.LogoUrl, through the shared downloader and its cache.
+	-- Returns asset, pixelWidth or nil, reason.
+	local function fromUrl(url)
 		if type(url) ~= "string" or not url:match("^https?://") then
-			return nil, "no LogoUrl"
+			return nil, "no link set"
 		end
-		local customAsset = getcustomasset or getsynasset
-		if type(customAsset) ~= "function" or type(writefile) ~= "function"
-			or type(isfile) ~= "function" or type(readfile) ~= "function" then
-			return nil, "executor has no file functions"
+		local asset, why, width = Media.Fetch(url)
+		if asset then
+			return asset, width
 		end
-		local path = CONFIG.LogoUrlFile
-		local PNG_SIGNATURE = "\137PNG\r\n\26\n"
-
-		local function width(data)
-			-- IHDR width: 4 bytes, big-endian, right after the 8-byte signature,
-			-- the chunk length and the "IHDR" tag.
-			local a, b, c, d = string.byte(data, 17, 20)
-			if a then
-				return a * 16777216 + b * 65536 + c * 256 + d
-			end
-			return nil
-		end
-
-		local ok, assetOrWhy, px = pcall(function()
-			local data
-			if isfile(path) then
-				data = readfile(path)
-			end
-			if type(data) ~= "string" or string.sub(data, 1, 8) ~= PNG_SIGNATURE then
-				data = nil
-				local requester = (syn and syn.request) or (http and http.request)
-					 or http_request or request
-				if type(requester) == "function" then
-					local response = requester({ Url = url, Method = "GET" })
-					if type(response) == "table" and response.Success ~= false
-						and (response.StatusCode == nil or response.StatusCode == 200) then
-						data = response.Body
-					end
-				elseif type(game.HttpGet) == "function" then
-					data = game:HttpGet(url)
-				end
-				if type(data) ~= "string" or string.sub(data, 1, 8) ~= PNG_SIGNATURE then
-					error("the link did not return a PNG (expired, private or not a direct image link)")
-				end
-				if type(isfolder) == "function" and type(makefolder) == "function" then
-					local folder = string.match(path, "^(.*)/[^/]+$")
-					if folder and not isfolder(folder) then
-						makefolder(folder)
-					end
-				end
-				writefile(path, data)
-			end
-			return customAsset(path), width(data)
-		end)
-		if ok and type(assetOrWhy) == "string" and assetOrWhy ~= "" then
-			return assetOrWhy, px
-		end
-		return nil, ok and "getcustomasset returned nothing" or tostring(assetOrWhy)
+		return nil, why
 	end
 
 	-- Route 3. Returns a Content or nil, reason.
@@ -1549,7 +1722,7 @@ OTk5OTk=
 		CONFIG.ResolvedLogo = { Image = custom }
 		CONFIG.LogoStatus = "CONFIG.Logo asset"
 	else
-		local downloaded, downloadPx = fromUrl()
+		local downloaded, downloadPx = fromUrl(CONFIG.LogoUrl)
 		if not downloaded and CONFIG.LogoUrl ~= "" then
 			warn(string.format("[%s] Logo download failed (%s); using the embedded logo.",
 				CONFIG.Title, tostring(downloadPx)))
@@ -1584,6 +1757,9 @@ OTk5OTk=
 
 	-- Optional icon-only logo for the sidebar, same formats as Logo.
 	local compact = normalise(CONFIG.LogoCompact)
+	if not compact and CONFIG.LogoCompactUrl ~= "" then
+		compact = fromUrl(CONFIG.LogoCompactUrl)
+	end
 	CONFIG.ResolvedLogoCompact = compact and { Image = compact } or CONFIG.ResolvedLogo
 end
 
@@ -1591,7 +1767,7 @@ end
 -- emblem (the full logo carries the LUMEN wordmark, which is unreadable at
 -- sidebar size) by cropping with ImageRect on the one embedded image, so no
 -- second asset is needed. Custom ids have unknown dimensions and are shown whole.
-local LOGO_EMBLEM = { X = 0.15, Y = 0.172, W = 0.703, H = 0.457 }
+local LOGO_EMBLEM = { X = 0.1133, Y = 0.1543, W = 0.7812, H = 0.4805 }
 local function applyLogo(label, source, compact)
 	if source.Content then
 		label.ImageContent = source.Content
@@ -3583,6 +3759,72 @@ bindAccent(function(a, b)
 	})
 end)
 Ambient.applyShimmer(false)
+
+-- Optional picture behind the window's content, from a link (see Media). It is
+-- the root's lowest layer, rounded with the window, and only as strong as the
+-- "Image strength" slider says, so text on top stays readable. Empty by default.
+Stats.BgImage = {}
+do
+	local label = New("ImageLabel", {
+		Name = "BackgroundImage",
+		BackgroundTransparency = 1,
+		BorderSizePixel = 0,
+		Image = "",
+		ImageTransparency = 1,
+		ScaleType = Enum.ScaleType.Crop,
+		Size = UDim2.fromScale(1, 1),
+		Visible = false,
+		ZIndex = 0,
+		Parent = root,
+	})
+	Round(label, Theme.Radius.XL)
+	local BgImage = Stats.BgImage
+	BgImage.Label = label
+	BgImage.Url = ""
+
+	local function paintStrength(animate)
+		local goal = 1 - math.clamp(State.BgImageStrength, 0, 100) / 100
+		if animate then
+			play(label, Motion.Base, "Out", { ImageTransparency = goal })
+		else
+			label.ImageTransparency = goal
+		end
+	end
+
+	-- Set(url, onDone): "" clears it. onDone(success, reason) when the download
+	-- (or the cache hit) finishes.
+	function BgImage.Set(url, onDone)
+		url = type(url) == "string" and url:gsub("^%s+", ""):gsub("%s+$", "") or ""
+		BgImage.Url = url
+		if url == "" then
+			label.Image = ""
+			label.Visible = false
+			if onDone then
+				onDone(true)
+			end
+			return
+		end
+		local mine = url
+		Media.Apply(label, url, function(success, reason)
+			if BgImage.Url ~= mine then
+				return -- the user changed it while it was downloading
+			end
+			if success then
+				label.Visible = true
+				paintStrength(true)
+			else
+				label.Visible = false
+				BgImage.Url = ""
+			end
+			if onDone then
+				onDone(success, reason)
+			end
+		end)
+	end
+	function BgImage.Strength()
+		paintStrength(true)
+	end
+end
 
 local sheen = New("Frame", {
 	Name = "Sheen",
@@ -7033,6 +7275,109 @@ do
 	})
 	InfoRow(backdrop, "Readability", "Brightness is capped so text stays legible", Theme.Color.TextMid)
 
+	-- BACKGROUND IMAGE ----------------------------------------------------
+	local picture = Section(column, "Background image", { Collapsed = true })
+	local pictureStatus = InfoRow(picture, "Image", "None", Theme.Color.TextLow)
+	if not Media.Available() then
+		InfoRow(picture, "Needs", "An executor with file access", Theme.Color.Caution)
+	end
+	local pictureField = New("Frame", {
+		Name = "ImageLink",
+		BackgroundColor3 = Theme.Color.White,
+		BackgroundTransparency = 0.92,
+		BorderSizePixel = 0,
+		Size = UDim2.new(1, -24, 0, 34),
+		LayoutOrder = nextOrder(picture),
+		Parent = picture,
+	})
+	Round(pictureField, Theme.Radius.SM)
+	local pictureStroke = Stroke(pictureField, 0.85)
+	local pictureBox = New("TextBox", {
+		Name = "Box",
+		BackgroundTransparency = 1,
+		BorderSizePixel = 0,
+		Size = UDim2.new(1, -20, 1, 0),
+		Position = UDim2.fromOffset(10, 0),
+		ClearTextOnFocus = false,
+		PlaceholderText = "Direct link to a PNG or JPEG (https://...)",
+		PlaceholderColor3 = Theme.Color.TextLow,
+		Text = "",
+		TextColor3 = Theme.Color.TextHi,
+		TextSize = Theme.Type.Caption,
+		TextXAlignment = Enum.TextXAlignment.Left,
+		TextTruncate = Enum.TextTruncate.AtEnd,
+		Parent = pictureField,
+	})
+	applyFont(pictureBox, "Medium")
+	pictureBox.Focused:Connect(function()
+		play(pictureStroke, Motion.Quick, "Out", { Color = Accent.Color, Transparency = 0.35 })
+	end)
+	pictureBox.FocusLost:Connect(function()
+		play(pictureStroke, Motion.Quick, "Out", { Color = Theme.Color.White, Transparency = 0.85 })
+	end)
+	local function paintPicture(url, success, reason)
+		if success and url ~= "" then
+			pictureStatus.Text = "Loaded"
+			pictureStatus.TextColor3 = Theme.Color.Positive
+		elseif success then
+			pictureStatus.Text = "None"
+			pictureStatus.TextColor3 = Theme.Color.TextLow
+		else
+			pictureStatus.Text = "Failed"
+			pictureStatus.TextColor3 = Theme.Color.Negative
+			notify("Image not loaded", "Error", tostring(reason), true)
+		end
+	end
+	local pictureGrid = ButtonGrid(picture, 2)
+	Button(pictureGrid, {
+		Text = "Use Image",
+		Icon = "check",
+		Callback = function()
+			local url = pictureBox.Text
+			pictureStatus.Text = "Loading..."
+			pictureStatus.TextColor3 = Theme.Color.Caution
+			Stats.BgImage.Set(url, function(success, reason)
+				paintPicture(Stats.BgImage.Url, success, reason)
+			end)
+		end,
+	})
+	Button(pictureGrid, {
+		Text = "Remove",
+		Icon = "close",
+		Style = "Secondary",
+		Callback = function()
+			pictureBox.Text = ""
+			Stats.BgImage.Set("")
+			paintPicture("", true)
+		end,
+	})
+	Slider(picture, {
+		Text = "Image strength",
+		Min = 5, Max = 80, Default = DEFAULTS.BgImageStrength, Step = 1, Suffix = "%",
+		Callback = function(value)
+			State.BgImageStrength = value
+			Stats.BgImage.Strength()
+		end,
+	})
+	Button(picture, {
+		Text = "Clear Image Cache",
+		Icon = "trash",
+		Style = "Secondary",
+		Callback = function()
+			local removed = Media.ClearCache()
+			if removed == nil then
+				notify("Cache not cleared", "Warning", "This executor cannot list or delete files.")
+			else
+				notify("Image cache cleared", "Success", removed .. " cached image(s) removed.")
+			end
+		end,
+	})
+	-- Lets a loaded config show its image in the box and status line.
+	Stats.BgImage.Mirror = function(url)
+		pictureBox.Text = url
+		paintPicture(url, true)
+	end
+
 	-- SHAPE -------------------------------------------------------------
 	local shape = Section(column, "Shape and glow")
 	Toggle(shape, {
@@ -7633,6 +7978,7 @@ function Config.BuildConfigs()
 			BgHue = State.BgHue,
 			BgSat = State.BgSat,
 			BgVal = State.BgVal,
+			BgImageUrl = Stats.BgImage and Stats.BgImage.Url ~= "" and Stats.BgImage.Url or nil,
 		}
 		if Config.Extra and Config.Extra.Collect then
 			local ok, extra = pcall(Config.Extra.Collect)
@@ -7687,6 +8033,15 @@ function Config.BuildConfigs()
 			end
 			if type(state.BgVal) == "number" then
 				State.BgVal = state.BgVal
+			end
+			if type(state.BgImageUrl) == "string" and Stats.BgImage then
+				-- Shown (and downloaded if the cache does not have it) in the
+				-- background; a failure only leaves the picture off.
+				Stats.BgImage.Set(state.BgImageUrl, function(success)
+					if success and Stats.BgImage.Mirror then
+						Stats.BgImage.Mirror(Stats.BgImage.Url)
+					end
+				end)
 			end
 			if type(state.BgPreset) == "number" then
 				State.BgPreset = Bg.Presets[state.BgPreset] and state.BgPreset or 0
@@ -11908,28 +12263,109 @@ local function buildToolsPage()
 			return pool[math.random(1, math.min(#pool, 5))].id
 		end
 
-		-- Re-runs this script in the new server (executors only). Queued once:
-		-- a failed hop leaves the queued code waiting for the next real one.
+		-- Re-runs this script in the new server (executors only), so Auto load
+		-- keeps working across hops. queue_on_teleport carries a small loader
+		-- that waits for the new game to load, then tries, in order:
+		--   1. getgenv().LumenReload (a link or a workspace file path),
+		--   2. CONFIG.ReloadUrl, then CONFIG.ReloadFile,
+		--   3. these workspace files, so just saving the script under one of
+		--      these names in the executor's workspace folder is enough.
+		-- Queued once: a failed hop leaves the queued code waiting for the
+		-- next real one.
+		local RELOAD_FILES = {
+			"ModernGui_client.lua",
+			"ModernGui.client.lua",
+			"ModernGui/ModernGui_client.lua",
+			"ModernGui/ModernGui.client.lua",
+			"Lumen.lua",
+			"ModernGui/Lumen.lua",
+		}
+
+		local function reloadSources()
+			local urls, files = {}, {}
+			local okEnv, custom = pcall(function()
+				return getgenv().LumenReload
+			end)
+			if okEnv and type(custom) == "string" and custom ~= "" then
+				if string.match(custom, "^https?://") then
+					table.insert(urls, custom)
+				else
+					table.insert(files, custom)
+				end
+			end
+			if CONFIG.ReloadUrl ~= "" then
+				table.insert(urls, CONFIG.ReloadUrl)
+			end
+			if CONFIG.ReloadFile ~= "" then
+				table.insert(files, CONFIG.ReloadFile)
+			end
+			for _, path in ipairs(RELOAD_FILES) do
+				table.insert(files, path)
+			end
+			return urls, files
+		end
+
 		local function queueReload()
 			if Hop.Queued then
 				return
 			end
 			local queue = queue_on_teleport
+				or queueonteleport
 				or (type(syn) == "table" and syn.queue_on_teleport)
 				or (type(fluxus) == "table" and fluxus.queue_on_teleport)
 			if type(queue) ~= "function" then
+				if not Hop.WarnedReload then
+					Hop.WarnedReload = true
+					notify("Auto load unavailable", "Warning",
+						"This executor has no queue_on_teleport, so the script will not restart after the hop.", true)
+				end
 				return
 			end
-			local code
-			if CONFIG.ReloadUrl ~= "" then
-				code = string.format("loadstring(game:HttpGet(%q))()", CONFIG.ReloadUrl)
-			elseif CONFIG.ReloadFile ~= "" then
-				code = string.format("loadstring(readfile(%q))()", CONFIG.ReloadFile)
+			local urls, files = reloadSources()
+			-- Is there anything the new server could actually load?
+			local usable = #urls > 0
+			if not usable and type(isfile) == "function" then
+				for _, path in ipairs(files) do
+					local ok, found = pcall(isfile, path)
+					if ok and found then
+						usable = true
+						break
+					end
+				end
 			end
-			if code and pcall(queue, code) then
+			if not usable and not Hop.WarnedReload then
+				Hop.WarnedReload = true
+				notify("Auto load not set up", "Warning",
+					"Save this script in your executor's workspace folder as ModernGui_client.lua, or set CONFIG.ReloadUrl, so it can restart after the hop.", true)
+			end
+			local lines = {
+				"if not game:IsLoaded() then game.Loaded:Wait() end",
+				"local Players = game:GetService('Players')",
+				"while not Players.LocalPlayer do task.wait() end",
+				"task.wait(1.5)",
+				"local done = false",
+			}
+			for _, url in ipairs(urls) do
+				table.insert(lines, string.format(
+					"if not done then done = pcall(function() loadstring(game:HttpGet(%q))() end) end", url))
+			end
+			for _, path in ipairs(files) do
+				table.insert(lines, string.format(
+					"if not done and type(isfile) == 'function' and isfile(%q) then done = pcall(function() loadstring(readfile(%q))() end) end",
+					path, path))
+			end
+			if pcall(queue, table.concat(lines, "\n")) then
 				Hop.Queued = true
 			end
 		end
+
+		-- Infinite Yield's approach (its "keepiy"): hook LocalPlayer.OnTeleport so
+		-- the reload is queued for ANY teleport, not only this script's own hop.
+		-- That covers the game teleporting you, a rejoin, or another script
+		-- calling TeleportService. queueReload() queues at most once.
+		track(player.OnTeleport:Connect(function()
+			queueReload()
+		end))
 
 		-- Whatever the hop stopped, switched back on from the snapshot taken
 		-- before it stopped them.
@@ -13292,20 +13728,52 @@ end
 -- without touching interactivity, and the previous value is restored so the
 -- host game keeps its own mouse handling.
 local savedMouseBehavior = nil
+local savedMouseIcon = nil
+local MOUSE_STEP = "ModernGuiMouse"
+
+-- Games (and Roblox's own first-person / shift-lock camera) put the cursor back
+-- to LockCenter every frame and again after a teleport or respawn. Freeing it
+-- once on open was therefore not enough: farming an egg and returning to the
+-- plot teleports the character, the camera script re-locked the mouse, and the
+-- open panel could no longer be clicked. While the panel is open the cursor is
+-- now re-freed every frame, after the camera has run.
+local function forceMouseFree()
+	if UserInputService.MouseBehavior ~= Enum.MouseBehavior.Default then
+		UserInputService.MouseBehavior = Enum.MouseBehavior.Default
+	end
+	if not UserInputService.MouseIconEnabled then
+		UserInputService.MouseIconEnabled = true
+	end
+end
 
 local function captureMouse()
 	if savedMouseBehavior == nil then
 		savedMouseBehavior = UserInputService.MouseBehavior
+		savedMouseIcon = UserInputService.MouseIconEnabled
+		-- A copy left over from a previous run may still hold this name.
+		pcall(function()
+			RunService:UnbindFromRenderStep(MOUSE_STEP)
+		end)
+		pcall(function()
+			RunService:BindToRenderStep(MOUSE_STEP, Enum.RenderPriority.Last.Value, forceMouseFree)
+		end)
 	end
-	UserInputService.MouseBehavior = Enum.MouseBehavior.Default
+	forceMouseFree()
 end
 
 local function releaseMouse()
 	if savedMouseBehavior == nil then
 		return
 	end
+	pcall(function()
+		RunService:UnbindFromRenderStep(MOUSE_STEP)
+	end)
 	UserInputService.MouseBehavior = savedMouseBehavior
+	if savedMouseIcon ~= nil then
+		UserInputService.MouseIconEnabled = savedMouseIcon
+	end
 	savedMouseBehavior = nil
+	savedMouseIcon = nil
 end
 
 setOpen = function(open)
