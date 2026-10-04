@@ -148,6 +148,7 @@ local DEFAULTS = {
 	EggsMoveSpeed = 500,
 	EggsHoldTime = 3,
 	EggsAutoFarm = false,
+	EggsAutoDip = false,
 	EggsAutoPlace = false,
 	EggsPlaceSlots = 2,
 	EggsSort = "Best",
@@ -3708,6 +3709,104 @@ local function panelHome()
 	return UDim2.new(0.5, drag.X, 0.5, drag.Y)
 end
 
+-- WINDOW SPRINGS (Fluent-style) ---------------------------------------------
+-- Open, close and drag are all springs instead of fixed tweens. A spring keeps
+-- its velocity when it is retargeted, so closing the window half way through
+-- opening (or grabbing it mid-settle) reverses smoothly instead of restarting
+-- an animation. The solver is the exact closed form of a damped spring, so it
+-- is stable at any frame rate. One RenderStepped connection exists only while
+-- something is still moving and is dropped the moment everything has settled.
+local Win = {
+	Base = 1, -- the layout scale the panel rests at
+	Scale = { p = 1, v = 0 }, -- multiplier on Base: the open "pop" and the drag lift
+	Slide = { p = 0, v = 0 }, -- extra vertical travel in px: rises on open, sinks on close
+	X = { p = 0, v = 0 }, -- drag offset (this is what drag.X follows)
+	Y = { p = 0, v = 0 },
+	ScaleGoal = 1,
+	SlideGoal = 0,
+	GoalX = 0,
+	GoalY = 0,
+	ScaleFreq = 5, ScaleZeta = 1, -- Hz, damping ratio (1 = no overshoot)
+	SlideFreq = 5, SlideZeta = 1,
+	Follow = 6, -- how closely the window trails the pointer; lower is floatier
+	Grabbed = false,
+	Conn = nil,
+}
+
+local function springStep(spring, goal, dt, frequency, zeta)
+	local w = 2 * math.pi * frequency
+	local d = spring.p - goal
+	local v = spring.v
+	if zeta >= 1 then
+		local e = math.exp(-w * dt)
+		local c = v + w * d
+		spring.p = goal + (d + c * dt) * e
+		spring.v = (v - c * w * dt) * e
+	else
+		local wd = w * math.sqrt(1 - zeta * zeta)
+		local e = math.exp(-zeta * w * dt)
+		local cs, sn = math.cos(wd * dt), math.sin(wd * dt)
+		local b = (v + zeta * w * d) / wd
+		spring.p = goal + e * (d * cs + b * sn)
+		spring.v = e * ((b * wd - zeta * w * d) * cs + (-d * wd - zeta * w * b) * sn)
+	end
+end
+
+function Win.Apply()
+	panelScale.Scale = Win.Base * Win.Scale.p
+	panel.Position = UDim2.new(0.5, drag.X, 0.5, drag.Y + Win.Slide.p)
+end
+
+function Win.Settled()
+	return not Win.Grabbed
+		and math.abs(Win.Scale.p - Win.ScaleGoal) < 0.0004 and math.abs(Win.Scale.v) < 0.004
+		and math.abs(Win.Slide.p - Win.SlideGoal) < 0.08 and math.abs(Win.Slide.v) < 0.4
+		and math.abs(Win.X.p - Win.GoalX) < 0.08 and math.abs(Win.X.v) < 0.4
+		and math.abs(Win.Y.p - Win.GoalY) < 0.08 and math.abs(Win.Y.v) < 0.4
+end
+
+-- Jumps every spring to its goal. Used when the loop finishes, and straight
+-- away when animations are reduced.
+function Win.Snap()
+	Win.Scale.p, Win.Scale.v = Win.ScaleGoal, 0
+	Win.Slide.p, Win.Slide.v = Win.SlideGoal, 0
+	Win.X.p, Win.X.v = Win.GoalX, 0
+	Win.Y.p, Win.Y.v = Win.GoalY, 0
+	drag.X, drag.Y = Win.GoalX, Win.GoalY
+	Win.Apply()
+end
+
+function Win.Stop()
+	if Win.Conn then
+		Win.Conn:Disconnect()
+		Win.Conn = nil
+	end
+end
+
+function Win.Run()
+	if Win.Conn then
+		return
+	end
+	-- Start from wherever the window really is: other code (a resize) may
+	-- have moved drag.X / drag.Y while nothing was animating.
+	Win.X.p, Win.X.v = drag.X, 0
+	Win.Y.p, Win.Y.v = drag.Y, 0
+	Win.Conn = RunService.RenderStepped:Connect(function(dt)
+		dt = math.min(dt, 1 / 20)
+		local speed = math.max(State.AnimSpeed, 0.1)
+		springStep(Win.Scale, Win.ScaleGoal, dt, Win.ScaleFreq * speed, Win.ScaleZeta)
+		springStep(Win.Slide, Win.SlideGoal, dt, Win.SlideFreq * speed, Win.SlideZeta)
+		springStep(Win.X, Win.GoalX, dt, Win.Follow * speed, 1)
+		springStep(Win.Y, Win.GoalY, dt, Win.Follow * speed, 1)
+		drag.X, drag.Y = Win.X.p, Win.Y.p
+		Win.Apply()
+		if Win.Settled() then
+			Win.Snap()
+			Win.Stop()
+		end
+	end)
+end
+
 -- Soft drop shadow: UIShadow does not exist, so two dark rounded frames sit behind the panel.
 for _, spec in ipairs({ { 44, 0.93, 14 }, { 18, 0.85, 6 } }) do
 	local shadow = New("Frame", {
@@ -3972,27 +4071,27 @@ local function stopDrag()
 		return
 	end
 
-	-- Release: adopt the target plus a short glide along the release
-	-- velocity, then ease the panel onto it so it settles instead of
-	-- stopping dead. A later setOpen tween on the same property supersedes
-	-- this one automatically.
-	local x, y = dragTarget.X, dragTarget.Y
-	if not motionReduced() then
-		x = x + Drag.Velocity.X * Drag.Glide
-		y = y + Drag.Velocity.Y * Drag.Glide
-	end
+	-- Release: nothing to adopt. The window's springs have been chasing the
+	-- pointer all along, so they simply carry on to the last target and settle
+	-- there: a soft landing with no overshoot.
 	Drag.Velocity.X, Drag.Velocity.Y = 0, 0
-	drag.X, drag.Y = clampDragOffset(x, y)
-	if dragSettle then
-		dragSettle:Cancel()
-	end
-	dragSettle = play(panel, Motion.Base, "Out", { Position = panelHome() })
+	local x, y = clampDragOffset(dragTarget.X, dragTarget.Y)
+	Win.Grabbed = false
+	Win.GoalX, Win.GoalY = x, y
 	if isOpen then
 		-- Put the panel back down: full size and resting shadow depth.
-		panelTween = play(panelScale, Motion.Quick, "Out", { Scale = Drag.Rest })
+		Win.ScaleGoal = 1
+		Win.ScaleFreq, Win.ScaleZeta = 7, 1
+		if motionReduced() then
+			Win.Snap()
+		else
+			Win.Run()
+		end
 		for _, shadow in ipairs(Drag.Shadows) do
 			play(shadow.Frame, Motion.Base, "Out", { BackgroundTransparency = shadow.Rest })
 		end
+	else
+		drag.X, drag.Y = x, y
 	end
 end
 
@@ -4021,8 +4120,11 @@ local function beginDrag(input)
 	local lastX, lastY, lastTime = drag.X, drag.Y, os.clock()
 
 	-- Lift: a hair smaller with a deeper shadow while held.
+	Win.Grabbed = true
+	Win.GoalX, Win.GoalY = drag.X, drag.Y
 	if not motionReduced() then
-		panelTween = play(panelScale, Motion.Quick, "Out", { Scale = scaleNow * 0.988 })
+		Win.ScaleGoal = 0.988
+		Win.ScaleFreq, Win.ScaleZeta = 9, 1
 		for _, shadow in ipairs(Drag.Shadows) do
 			play(shadow.Frame, Motion.Quick, "Out", { BackgroundTransparency = math.max(shadow.Rest - 0.06, 0.5) })
 		end
@@ -4033,6 +4135,7 @@ local function beginDrag(input)
 			local dx = (changed.Position.X - origin.X) / scaleNow
 			local dy = (changed.Position.Y - origin.Y) / scaleNow
 			dragTarget.X, dragTarget.Y = clampDragOffset(startX + dx, startY + dy)
+			Win.GoalX, Win.GoalY = dragTarget.X, dragTarget.Y
 
 			-- Smoothed pointer velocity, used for the release glide.
 			local now = os.clock()
@@ -4051,20 +4154,10 @@ local function beginDrag(input)
 		end
 	end)
 
+	-- The window's springs (Win.Run) now do the following; nothing else is
+	-- attached per drag besides the input listeners above and below.
 	if not motionReduced() then
-		dragStep = RunService.RenderStepped:Connect(function(dt)
-			-- A drag left running while the panel closes or the reveal starts
-			-- would keep writing Position every frame and fight that tween.
-			if not isOpen or not holder.Visible then
-				return
-			end
-			-- Exponential smoothing: the panel trails the cursor slightly
-			-- without feeling disconnected, whatever the frame rate.
-			local alpha = 1 - math.exp(-Drag.Follow * dt)
-			drag.X = drag.X + (dragTarget.X - drag.X) * alpha
-			drag.Y = drag.Y + (dragTarget.Y - drag.Y) * alpha
-			panel.Position = panelHome()
-		end)
+		Win.Run()
 	end
 
 	dragEnd = UserInputService.InputEnded:Connect(function(ended)
@@ -8720,6 +8813,7 @@ local function buildToolsPage()
 		SmoothMove = DEFAULTS.EggsSmoothMove,
 		MoveSpeed = DEFAULTS.EggsMoveSpeed,
 		HoldTime = DEFAULTS.EggsHoldTime,
+		AutoDip = DEFAULTS.EggsAutoDip,
 		FarmTypes = {},
 		FarmRarities = {},
 		Processed = {},
@@ -10202,6 +10296,229 @@ local function buildToolsPage()
 	-- valid target it reports "Waiting for Eggs" and parks on the live registry
 	-- rather than sleeping a fixed interval, so the first eligible egg is picked
 	-- up the moment it spawns.
+	-- AUTO DIP --------------------------------------------------------------
+	-- From a captured manual dip: the drop is the on-screen DropEggVolcanoButton
+	-- (PlayerGui.Main.ActionsHolder). Within ~0.1 s the server sends RE/VolcanoDipResult
+	-- to every client, with the owner's UserId. The result is revealed 7.2 s after
+	-- StartedAt and the dip ends at ArriveAt (9.2 s). Server times, so the wait is
+	-- ArriveAt - workspace:GetServerTimeNow().
+	local Dip = {
+		-- Root positions where manual dips worked (the volcano does not move).
+		Hover = Vector3.new(-5086, 41480, -3443),
+		Above = 35, -- studs over VolcanoTop's top face, when it is found by tag
+		ButtonWait = 4, -- seconds to wait for the button to show
+		ResultWait = 3, -- seconds to wait for the result after one press
+		MaxWait = 16, -- hard ceiling for waiting out the dip
+	}
+
+	local function dipRemote(name)
+		local packages = game:GetService("ReplicatedStorage"):FindFirstChild("packages")
+		local net = packages and packages:FindFirstChild("Net")
+		return net and net:FindFirstChild("RE/" .. name) or nil
+	end
+
+	local function dipButton()
+		local gui = player:FindFirstChildOfClass("PlayerGui")
+		local found = gui and gui:FindFirstChild("DropEggVolcanoButton", true)
+		if found and found:IsA("GuiButton") then
+			return found
+		end
+		return nil
+	end
+
+	local function guiShown(object)
+		while object and not object:IsA("PlayerGui") do
+			if object:IsA("GuiObject") and not object.Visible then
+				return false
+			end
+			if object:IsA("LayerCollector") and not object.Enabled then
+				return false
+			end
+			object = object.Parent
+		end
+		return true
+	end
+
+	-- Three ways to press it, tried in turn by the caller: the signals, the
+	-- existing connections, then a real click on its centre.
+	local function pressDipButton(button, attempt)
+		if attempt == 1 then
+			if type(firesignal) ~= "function" then
+				return false
+			end
+			pcall(firesignal, button.Activated)
+			pcall(firesignal, button.MouseButton1Click)
+			return true
+		elseif attempt == 2 then
+			if type(getconnections) ~= "function" then
+				return false
+			end
+			local fired = false
+			for _, signal in ipairs({ button.Activated, button.MouseButton1Click }) do
+				local ok, list = pcall(getconnections, signal)
+				if ok and type(list) == "table" then
+					for _, connection in ipairs(list) do
+						if pcall(function()
+							connection:Fire()
+						end) then
+							fired = true
+						end
+					end
+				end
+			end
+			return fired
+		end
+		if not virtualInput then
+			return false
+		end
+		local inset = game:GetService("GuiService"):GetGuiInset()
+		local centre = button.AbsolutePosition + button.AbsoluteSize / 2 + inset
+		pcall(function()
+			virtualInput:SendMouseButtonEvent(centre.X, centre.Y, 0, true, game, 0)
+		end)
+		task.wait(0.05)
+		pcall(function()
+			virtualInput:SendMouseButtonEvent(centre.X, centre.Y, 0, false, game, 0)
+		end)
+		return true
+	end
+
+	-- Flies to the volcano with the egg, presses the drop button, waits the dip
+	-- out and stops there (the caller goes home). Returns true plus the server's
+	-- result table, or false plus a reason.
+	local function dipInVolcano()
+		local resultRemote = dipRemote("VolcanoDipResult")
+		if not resultRemote then
+			return false, "RE/VolcanoDipResult was not found"
+		end
+		local cancelRemote = dipRemote("VolcanoDipCancelled")
+		local result, cancelled = nil, false
+		local connections = {}
+		table.insert(connections, resultRemote.OnClientEvent:Connect(function(data)
+			if type(data) == "table" and data.Owner == player.UserId then
+				result = data
+			end
+		end))
+		if cancelRemote then
+			table.insert(connections, cancelRemote.OnClientEvent:Connect(function()
+				cancelled = true
+			end))
+		end
+
+		local state = nil
+		local function finish(ok, info)
+			for _, connection in ipairs(connections) do
+				pcall(function()
+					connection:Disconnect()
+				end)
+			end
+			if state then
+				Phase.Release(state)
+			end
+			return ok, info
+		end
+		state = Phase.Begin()
+		if not state then
+			return finish(false, "could not start moving")
+		end
+
+		local function alive()
+			return Phase.State == state and Eggs.FarmActive and not cancelled
+		end
+		local function keepAlive()
+			state.Expires = os.clock() + Phase.Lease
+		end
+
+		local function goTo(point)
+			local root = state.Root
+			state.Egg, state.Prompt, state.Height = nil, nil, nil
+			state.Goal = point
+			local speed = Eggs.SmoothMove and math.max(Eggs.MoveSpeed, 1) or nil
+			state.Speed = speed
+			state.Stage = speed and "level" or nil
+			if speed and (point - root.Position).Magnitude > 3 then
+				local startedAt = os.clock()
+				local budget = math.max(6, Phase.PathLength(root.Position, point) / speed + 4)
+				while not Phase.Settled(state) and os.clock() - startedAt <= budget do
+					if not alive() then
+						return false
+					end
+					keepAlive()
+					RunService.Heartbeat:Wait()
+				end
+			end
+			-- From here the tick only holds the point.
+			state.Speed = nil
+			Phase.Snap(state)
+			RunService.Heartbeat:Wait()
+			return Phase.Settled(state)
+		end
+
+		-- The captured point first. The tagged VolcanoTop is a second try, only
+		-- when it is somewhere else.
+		local points = { Dip.Hover }
+		local tagged = game:GetService("CollectionService"):GetTagged("VolcanoTop")[1]
+		if tagged and tagged:IsA("BasePart") then
+			local point = tagged.Position + Vector3.new(0, tagged.Size.Y / 2 + Dip.Above, 0)
+			if (point - Dip.Hover).Magnitude > 25 then
+				table.insert(points, point)
+			end
+		end
+
+		for _, point in ipairs(points) do
+			if not alive() or result then
+				break
+			end
+			if goTo(point) then
+				local button = dipButton()
+				local waitedFrom = os.clock()
+				while not (button and guiShown(button)) and os.clock() - waitedFrom < Dip.ButtonWait and alive() do
+					keepAlive()
+					task.wait(0.1)
+					button = dipButton()
+				end
+				if button then
+					for attempt = 1, 3 do
+						if result or not alive() then
+							break
+						end
+						keepAlive()
+						if pressDipButton(button, attempt) then
+							local pressedAt = os.clock()
+							while not result and alive() and os.clock() - pressedAt < Dip.ResultWait do
+								keepAlive()
+								task.wait(0.05)
+							end
+						end
+					end
+				end
+			end
+		end
+
+		if cancelled then
+			return finish(false, "the server cancelled the dip")
+		end
+		if not result then
+			if not Eggs.FarmActive then
+				return finish(false, "stopped")
+			end
+			return finish(false, "no result came back: the drop button was missing or the press was not accepted")
+		end
+
+		-- Hold position until the dip has played out; leaving earlier would put
+		-- the egg out of range and the server cancels past 400 studs.
+		local endAt = (tonumber(result.ArriveAt) or (workspace:GetServerTimeNow() + 9.2)) + 0.3
+		local deadline = os.clock() + Dip.MaxWait
+		while workspace:GetServerTimeNow() < endAt and os.clock() < deadline and alive() do
+			keepAlive()
+			RunService.Heartbeat:Wait()
+		end
+		if cancelled then
+			return finish(false, "the server cancelled the dip")
+		end
+		return finish(true, result)
+	end
+
 	local function farmStep()
 		if not characterRoot() then
 			setFarmStatus("ON / Waiting for Character", "waiting", "Waiting for your character")
@@ -10230,6 +10547,20 @@ local function buildToolsPage()
 		-- as the current target while the farm walks home.
 		Eggs.Card.Target = nil
 		Eggs.Card.Rarity = nil
+		if picked and confirmed and Eggs.AutoDip then
+			Eggs.SetStep("Dipping")
+			publishEggs()
+			local dipOk, info = dipInVolcano()
+			if not dipOk then
+				warn("[Eggs] volcano dip failed: " .. tostring(info))
+				if not Eggs.DipWarned then
+					Eggs.DipWarned = true
+					notify("Volcano dip failed", "Warning", tostring(info))
+				end
+			elseif type(info) == "table" and info.Success then
+				notify("Magma mutation", "Success", tostring(info.Egg or name) .. " mutated into " .. tostring(info.Mutation or "Magma"))
+			end
+		end
 		Eggs.SetStep("Returning")
 		publishEggs() -- SetStep only publishes when the step changed
 		teleportHome(true)
@@ -11969,6 +12300,15 @@ local function buildToolsPage()
 			Eggs.HoldTime = value
 		end,
 	})
+	Toggle(farm, {
+		Text = "Dip eggs in volcano",
+		Description = "After each pickup: flies to the volcano, drops the egg for a 15% Magma chance, waits it out, then goes home",
+		Default = DEFAULTS.EggsAutoDip,
+		Callback = function(enabled)
+			State.EggsAutoDip = enabled
+			Eggs.AutoDip = enabled
+		end,
+	})
 	local farmGrid = ButtonGrid(farm, 2)
 	Button(farmGrid, {
 		Text = "Stop farming",
@@ -13685,17 +14025,17 @@ applyLayout = function()
 	local compact = width < CONFIG.CompactBelow
 
 	layout.Scale = scale
+	Win.Base = scale
 	panel.Size = UDim2.fromOffset(math.floor(width), math.floor(height))
 	if isOpen then
 		-- The panel may have been dragged outside the new viewport, so the
 		-- stored offset is re-clamped against the resized panel and holder.
 		drag.X, drag.Y = clampDragOffset(drag.X, drag.Y)
-		panel.Position = panelHome()
-		if panelTween then
-			panelTween:Cancel()
-			panelTween = nil
+		if not Win.Grabbed then
+			Win.GoalX, Win.GoalY = drag.X, drag.Y
 		end
-		panelScale.Scale = scale
+		Win.X.p, Win.Y.p = drag.X, drag.Y
+		Win.Apply()
 	end
 
 	local sidebarWidth = compact and CONFIG.SidebarCompact or CONFIG.SidebarWide
@@ -13801,32 +14141,51 @@ setOpen = function(open)
 	end
 
 	if open then
+		local wasVisible = holder.Visible
 		scrim.Visible = true
 		captureMouse()
 		holder.Visible = true
 		-- A resize while the panel was closed can leave the stored offset
 		-- outside the new viewport, so re-clamp before revealing it.
 		drag.X, drag.Y = clampDragOffset(drag.X, drag.Y)
-		panelScale.Scale = layout.Scale * 0.94
-		-- Reveal from slightly below wherever the panel was last left.
-		panel.Position = UDim2.new(0.5, drag.X, 0.5, drag.Y + 16)
-		panelTween = play(panelScale, Motion.Reveal, "Back", { Scale = layout.Scale })
-		play(panel, Motion.Reveal, "Out", { Position = panelHome() })
+		Win.Base = layout.Scale
+		Win.GoalX, Win.GoalY = drag.X, drag.Y
+		Win.ScaleGoal, Win.SlideGoal = 1, 0
+		-- Slightly under-damped, so the window pops a touch past full size and
+		-- settles; the rise itself is critically damped and just glides in.
+		Win.ScaleFreq, Win.ScaleZeta = 4.2, 0.62
+		Win.SlideFreq, Win.SlideZeta = 4.5, 1
+		if motionReduced() then
+			Win.Snap()
+		else
+			if not wasVisible then
+				-- Fresh open: start small and low. Re-opening mid-close keeps the
+				-- springs' current position and velocity, so it turns around.
+				Win.Scale.p, Win.Scale.v = 0.88, 0
+				Win.Slide.p, Win.Slide.v = 30, 0
+				Win.Apply()
+			end
+			Win.Run()
+		end
 		play(scrim, Motion.Base, "Out", { BackgroundTransparency = 0.5 })
 		showFab(false)
 	else
 		-- Minimize: the panel recedes toward the floating button's corner and
 		-- only once it is gone does the button arrive, so the two read as one
 		-- motion rather than a panel vanishing under a separate pop-in.
-		-- The recede leans toward the button it is about to become.
-		local towardX, towardY = 0, 26
+		local towardY = 26
 		if fab.Parent then
 			local viewport = screen.AbsoluteSize
-			towardX = (fab.AbsolutePosition.X + fab.AbsoluteSize.X / 2 - viewport.X / 2 - drag.X) * 0.12
 			towardY = (fab.AbsolutePosition.Y + fab.AbsoluteSize.Y / 2 - viewport.Y / 2 - drag.Y) * 0.12
 		end
-		panelTween = play(panelScale, Motion.Base, "Sine", { Scale = layout.Scale * 0.88 })
-		play(panel, Motion.Base, "Sine", { Position = UDim2.new(0.5, drag.X + towardX, 0.5, drag.Y + towardY) })
+		Win.ScaleGoal, Win.SlideGoal = 0.92, towardY
+		Win.ScaleFreq, Win.ScaleZeta = 9, 1
+		Win.SlideFreq, Win.SlideZeta = 9, 1
+		if motionReduced() then
+			Win.Snap()
+		else
+			Win.Run()
+		end
 		play(scrim, Motion.Quick, "In", { BackgroundTransparency = 1 })
 		releaseMouse()
 		task.delay(scaledTime(Motion.Base), function()
@@ -14563,6 +14922,7 @@ local function cleanup()
 		dragSettle:Cancel()
 		dragSettle = nil
 	end
+	Win.Stop()
 	releaseMouse() -- never leave the cursor forced free if we were torn down mid-open
 	if blurEffect then
 		blurEffect:Destroy()
